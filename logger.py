@@ -1087,12 +1087,12 @@ async def _mirror_worker(db: asyncpg.Pool, session: aiohttp.ClientSession) -> No
                     ref_preview = ref_full[:100]
                     if len(ref_full) > 100:
                         ref_preview += "…"
-                        jump_row = await db.fetchrow(
-                            "SELECT jump_url FROM mirror_message_map WHERE source_message_id = $1 AND webhook_url = $2",
-                            reply_to, webhook_url,
-                        )
-                        if jump_row:
-                            ref_preview += f" [↗]({jump_row['jump_url']})"
+                    jump_row = await db.fetchrow(
+                        "SELECT jump_url FROM mirror_message_map WHERE source_message_id = $1 AND webhook_url = $2",
+                        reply_to, webhook_url,
+                    )
+                    if jump_row:
+                        ref_preview += f" [↗]({jump_row['jump_url']})"
                     post_content = f"> **{ref_row['author']}**: {ref_preview}\n{post_content}"
             if extra_urls:
                 post_content = (post_content + "\n" + "\n".join(extra_urls)).strip()
