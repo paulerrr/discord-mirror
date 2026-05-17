@@ -504,6 +504,12 @@ async def _setup_server_mirrors(db: aiosqlite.Connection) -> None:
             await _ensure_server_mirror_voice_channel(db, dst_guild, channel, category_cache)
         for channel in src_guild.forums:
             await _ensure_server_mirror_forum(db, dst_guild, channel, category_cache)
+        unreadable_cat = discord.utils.get(dst_guild.categories, name=UNREADABLE_CATEGORY_NAME)
+        if unreadable_cat is not None:
+            try:
+                await unreadable_cat.edit(position=len(dst_guild.categories) - 1)
+            except Exception as exc:
+                console.warning("Server mirror: could not move '%s' to bottom: %s", UNREADABLE_CATEGORY_NAME, exc)
 
 
 ARCHIVE_CATEGORY_NAME = "📁 Archived"
@@ -567,6 +573,11 @@ async def _archive_sync_worker(db: aiosqlite.Connection) -> None:
                         console.info("Archive sync: created '%s' in %s", UNREADABLE_CATEGORY_NAME, dst_guild.name)
                     except Exception as exc:
                         console.warning("Archive sync: could not create unreadable category: %s", exc)
+                if dst_unreadable_cat is not None:
+                    try:
+                        await dst_unreadable_cat.edit(position=len(dst_guild.categories) - 1)
+                    except Exception as exc:
+                        console.warning("Archive sync: could not move '%s' to bottom: %s", UNREADABLE_CATEGORY_NAME, exc)
                 return dst_unreadable_cat
 
             category_cache: dict[str, discord.CategoryChannel] = {}
