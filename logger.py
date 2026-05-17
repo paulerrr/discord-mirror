@@ -256,14 +256,7 @@ async def _ensure_server_mirror_channel(
         if await cur.fetchone():
             return
 
-    readable = await _probe_readable(src_channel)
-    if not readable:
-        console.info("Server mirror: #%s is unreadable, placing in '%s'", src_channel.name, UNREADABLE_CATEGORY_NAME)
-
-    base_cat_name = (
-        src_channel.category.name if (readable and src_channel.category) else
-        UNREADABLE_CATEGORY_NAME if not readable else None
-    )
+    base_cat_name = src_channel.category.name if src_channel.category else None
 
     dst_channel = discord.utils.get(dst_guild.text_channels, name=src_channel.name)
     if dst_channel is None:
@@ -294,22 +287,9 @@ async def _ensure_server_mirror_channel(
             console.warning("Server mirror: no category with room for #%s, giving up", src_channel.name)
             return
 
-    webhook_url: str | None = None
-    if readable:
-        try:
-            webhooks = await dst_channel.webhooks()
-            wh = discord.utils.get(webhooks, name="MessageMirror")
-            if wh is None:
-                wh = await dst_channel.create_webhook(name="MessageMirror")
-            console.info("Server mirror: created webhook in #%s (%s)", dst_channel.name, dst_guild.name)
-            webhook_url = wh.url
-        except Exception as exc:
-            console.warning("Server mirror: could not create webhook in #%s: %s", dst_channel.name, exc)
-            return
-
     await db.execute(
         "INSERT OR REPLACE INTO server_mirror_channels (source_channel_id, dest_channel_id, webhook_url, unreadable) VALUES (?, ?, ?, ?)",
-        (src_channel.id, dst_channel.id, webhook_url, 0 if readable else 1),
+        (src_channel.id, dst_channel.id, None, 0),
     )
     await db.commit()
 
@@ -353,19 +333,9 @@ async def _ensure_server_mirror_voice_channel(
             console.warning("Server mirror: no category with room for #%s (voice), giving up", src_channel.name)
             return
 
-    try:
-        webhooks = await dst_channel.webhooks()
-        wh = discord.utils.get(webhooks, name="MessageMirror")
-        if wh is None:
-            wh = await dst_channel.create_webhook(name="MessageMirror")
-            console.info("Server mirror: created webhook in voice #%s (%s)", dst_channel.name, dst_guild.name)
-    except Exception as exc:
-        console.warning("Server mirror: could not create webhook in voice #%s: %s", dst_channel.name, exc)
-        return
-
     await db.execute(
         "INSERT OR REPLACE INTO server_mirror_channels (source_channel_id, dest_channel_id, webhook_url) VALUES (?, ?, ?)",
-        (src_channel.id, dst_channel.id, wh.url),
+        (src_channel.id, dst_channel.id, None),
     )
     await db.commit()
 
@@ -413,21 +383,98 @@ async def _ensure_server_mirror_forum(
             console.warning("Server mirror: no category with room for forum #%s, giving up", src_forum.name)
             return
 
-    try:
-        webhooks = await dst_forum.webhooks()
-        wh = discord.utils.get(webhooks, name="MessageMirror")
-        if wh is None:
-            wh = await dst_forum.create_webhook(name="MessageMirror")
-            console.info("Server mirror: created webhook in forum #%s (%s)", dst_forum.name, dst_guild.name)
-    except Exception as exc:
-        console.warning("Server mirror: could not create webhook in forum #%s: %s", dst_forum.name, exc)
-        return
-
     await db.execute(
         "INSERT OR REPLACE INTO server_mirror_forums (source_forum_id, dest_forum_id, webhook_url) VALUES (?, ?, ?)",
-        (src_forum.id, dst_forum.id, wh.url),
+        (src_forum.id, dst_forum.id, None),
     )
     await db.commit()
+
+
+async def _provision_mirror_channel_webhook(
+    db: aiosqlite.Connection,
+    dst_guild: discord.Guild,
+    src_channel: discord.TextChannel | discord.VoiceChannel,
+    category_cache: dict[str, discord.CategoryChannel],
+) -> None:
+    async with db.execute(
+        "SELECT dest_channel_id, webhook_url FROM server_mirror_channels WHERE source_channel_id = ?",
+        (src_channel.id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None or row[1] is not None:
+        return
+
+    dest_channel_id = row[0]
+    dst_channel = dst_guild.get_channel(dest_channel_id)
+    if not isinstance(dst_channel, discord.TextChannel):
+        return
+
+    readable = isinstance(src_channel, discord.VoiceChannel) or await _probe_readable(src_channel)
+    if not readable:
+        unreadable_cat = discord.utils.get(dst_guild.categories, name=UNREADABLE_CATEGORY_NAME)
+        if unreadable_cat is None:
+            try:
+                unreadable_cat = await dst_guild.create_category(UNREADABLE_CATEGORY_NAME)
+            except Exception as exc:
+                console.warning("Server mirror: could not create unreadable category: %s", exc)
+        if unreadable_cat is not None:
+            try:
+                await dst_channel.edit(category=unreadable_cat)
+            except Exception as exc:
+                console.warning("Server mirror: could not move #%s to unreadable: %s", dst_channel.name, exc)
+        await db.execute(
+            "UPDATE server_mirror_channels SET unreadable = 1 WHERE source_channel_id = ?",
+            (src_channel.id,),
+        )
+        await db.commit()
+        console.info("Server mirror: #%s is unreadable, placed in '%s'", src_channel.name, UNREADABLE_CATEGORY_NAME)
+        return
+
+    try:
+        existing = await dst_channel.webhooks()
+        wh = discord.utils.get(existing, name="MessageMirror")
+        if wh is None:
+            wh = await dst_channel.create_webhook(name="MessageMirror")
+        await db.execute(
+            "UPDATE server_mirror_channels SET webhook_url = ? WHERE source_channel_id = ?",
+            (wh.url, src_channel.id),
+        )
+        await db.commit()
+        console.info("Server mirror: created webhook in #%s (%s)", dst_channel.name, dst_guild.name)
+    except Exception as exc:
+        console.warning("Server mirror: could not create webhook in #%s: %s", dst_channel.name, exc)
+
+
+async def _provision_mirror_forum_webhook(
+    db: aiosqlite.Connection,
+    dst_guild: discord.Guild,
+    src_forum: discord.ForumChannel,
+) -> None:
+    async with db.execute(
+        "SELECT dest_forum_id, webhook_url FROM server_mirror_forums WHERE source_forum_id = ?",
+        (src_forum.id,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None or row[1] is not None:
+        return
+
+    dst_forum = dst_guild.get_channel(row[0])
+    if not isinstance(dst_forum, discord.ForumChannel):
+        return
+
+    try:
+        existing = await dst_forum.webhooks()
+        wh = discord.utils.get(existing, name="MessageMirror")
+        if wh is None:
+            wh = await dst_forum.create_webhook(name="MessageMirror")
+        await db.execute(
+            "UPDATE server_mirror_forums SET webhook_url = ? WHERE source_forum_id = ?",
+            (wh.url, src_forum.id),
+        )
+        await db.commit()
+        console.info("Server mirror: created webhook in forum #%s (%s)", dst_forum.name, dst_guild.name)
+    except Exception as exc:
+        console.warning("Server mirror: could not create webhook in forum #%s: %s", dst_forum.name, exc)
 
 
 async def _clear_dest_guild(db: aiosqlite.Connection, dst_guild: discord.Guild) -> None:
@@ -501,12 +548,26 @@ async def _setup_server_mirrors(db: aiosqlite.Connection) -> None:
                      len(src_guild.voice_channels), len(src_guild.forums))
         await _clear_dest_guild(db, dst_guild)
         category_cache: dict[str, discord.CategoryChannel] = {}
+
+        # Pass 1: create channel structure (fast — no probing, no webhooks)
         for channel in src_guild.text_channels:
             await _ensure_server_mirror_channel(db, dst_guild, channel, category_cache)
         for channel in src_guild.voice_channels:
             await _ensure_server_mirror_voice_channel(db, dst_guild, channel, category_cache)
         for channel in src_guild.forums:
             await _ensure_server_mirror_forum(db, dst_guild, channel, category_cache)
+
+        console.info("Server mirror: structure ready for %s → %s, provisioning webhooks",
+                     src_guild.name, dst_guild.name)
+
+        # Pass 2: probe readability, create webhooks, move unreadable channels
+        for channel in src_guild.text_channels:
+            await _provision_mirror_channel_webhook(db, dst_guild, channel, category_cache)
+        for channel in src_guild.voice_channels:
+            await _provision_mirror_channel_webhook(db, dst_guild, channel, category_cache)
+        for channel in src_guild.forums:
+            await _provision_mirror_forum_webhook(db, dst_guild, channel)
+
         unreadable_cat = discord.utils.get(dst_guild.categories, name=UNREADABLE_CATEGORY_NAME)
         if unreadable_cat is not None:
             try:
@@ -1259,10 +1320,13 @@ class MessageLogger(discord.Client):
                     if dst_guild:
                         if isinstance(channel, discord.TextChannel):
                             await _ensure_server_mirror_channel(self._db, dst_guild, channel, {})
+                            await _provision_mirror_channel_webhook(self._db, dst_guild, channel, {})
                         elif isinstance(channel, discord.VoiceChannel):
                             await _ensure_server_mirror_voice_channel(self._db, dst_guild, channel, {})
+                            await _provision_mirror_channel_webhook(self._db, dst_guild, channel, {})
                         else:
                             await _ensure_server_mirror_forum(self._db, dst_guild, channel, {})
+                            await _provision_mirror_forum_webhook(self._db, dst_guild, channel)
                 break
 
     async def on_error(self, event: str, *args, **kwargs) -> None:  # type: ignore[override]
