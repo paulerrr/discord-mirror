@@ -1,17 +1,26 @@
 # discord-mirror
 
-A Discord self-bot that logs messages to disk and mirrors channels or entire servers to a destination guild via webhooks.
+A Discord self-bot with two independent features: **message logging** and **server/channel mirroring**. You can use either or both — logging works with no mirror configuration, and mirroring works without a log channel.
 
 ## Features
+
+### Message logging
+Logging is always active for watched guilds. No extra configuration beyond a token is required.
 
 - **Message logging** — every new message, edit, and delete is written to dated flat files under `logs/<guild>/<channel>_YYYY-MM-DD.log`
 - **SQLite cache** — message content and metadata stored in `data/cache.db` so deleted messages can be logged with their original content
 - **Media saving** — attachments and stickers downloaded locally to `media/`
-- **Log channel** — edits and deletes posted to a Discord channel in real time with attachment previews
-- **Channel mirroring** — relay specific channels to webhook URLs, including edits, deletes, and reply threading
-- **Server mirroring** — replicate an entire guild's channel structure to a destination guild; channels probe for readability, unreadable ones are grouped separately, and the structure stays in sync via a periodic archive worker
-- **Thread mirroring** — threads created in mirrored text channels are automatically created in the destination and kept in sync
+- **Log channel** — optionally post edit/delete summaries to a Discord channel in real time with attachment previews (`LOG_CHANNEL_ID`)
 - **Missed delete detection** — on reconnect, recent history is fetched per channel and any messages deleted while offline are logged retroactively
+
+### Mirroring
+Mirroring is opt-in and configured separately from logging. Set `MIRROR_CHANNELS` or `MIRROR_SERVERS` (or both) to enable it.
+
+- **Channel mirroring** — relay specific channels to webhook URLs, including edits, deletes, and reply threading (`MIRROR_CHANNELS`)
+- **Server mirroring** — replicate an entire guild's channel structure to a destination guild; channels probe for readability, unreadable ones are grouped separately, and the structure stays in sync via a periodic archive worker (`MIRROR_SERVERS`)
+- **Thread mirroring** — threads created in mirrored text channels are automatically created in the destination and kept in sync
+
+### General
 - **Multi-account** — multiple user tokens can be provided; each claims guilds and shares one DB
 
 ## Setup
