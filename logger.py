@@ -588,6 +588,25 @@ async def _setup_server_mirrors(db: aiosqlite.Connection) -> None:
         if src_guild is None or dst_guild is None:
             console.warning("Server mirror: guild object unavailable for %s→%s", src_guild_id, dst_guild_id)
             continue
+        all_src_ids = (
+            [ch.id for ch in src_guild.text_channels]
+            + [ch.id for ch in src_guild.voice_channels]
+            + [ch.id for ch in src_guild.forums]
+        )
+        if all_src_ids:
+            placeholders = ",".join("?" * len(all_src_ids))
+            async with db.execute(
+                f"SELECT COUNT(*) FROM server_mirror_channels WHERE source_channel_id IN ({placeholders})",
+                all_src_ids,
+            ) as cur:
+                already_mapped = (await cur.fetchone())[0]
+            if already_mapped:
+                console.info(
+                    "Server mirror: %s → %s already set up (%d channels mapped), skipping rebuild",
+                    src_guild.name, dst_guild.name, already_mapped,
+                )
+                continue
+
         console.info("Server mirror: setting up %s → %s (%d text, %d voice, %d forum channels)",
                      src_guild.name, dst_guild.name, len(src_guild.text_channels),
                      len(src_guild.voice_channels), len(src_guild.forums))
