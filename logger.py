@@ -1281,6 +1281,7 @@ async def _daily_order_sync_worker(db: aiosqlite.Connection) -> None:
     while True:
         await asyncio.sleep(86400)
         console.info("Daily order sync: starting")
+        await _refresh_order_cache(db)
         await _sync_channel_ordering(db)
 
 
