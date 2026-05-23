@@ -8,7 +8,7 @@ import aiosqlite
 import logging
 import logging.handlers
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -94,6 +94,17 @@ def _format_ts(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def _fmt_duration(seconds: float) -> str:
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h {m}m {s}s"
+    if m:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
 def _guild_name(message: discord.Message) -> str | None:
     return message.guild.name if message.guild else None
 
@@ -145,6 +156,9 @@ _download_sem = asyncio.Semaphore(5)
 _ready_count   = 0
 _total_clients = 0
 _server_mirror_ready: asyncio.Event | None = None
+
+# (guild_id, user_id) → (channel_id, channel_name, joined_at)
+_active_voice: dict[tuple[int, int], tuple[int, str, datetime]] = {}
 
 
 async def _post_worker() -> None:
@@ -235,6 +249,20 @@ async def _get_or_create_category(
                     await cat.edit(position=prev_cat.position + 1)
                 except Exception as exc:
                     console.warning("Server mirror: could not reorder category '%s': %s", name, exc)
+        else:
+            # Discord appends new categories at the bottom. If special categories
+            # (unreadable/archived) already exist, insert the new one just above them.
+            special_positions = [
+                c.position for c in dst_guild.categories
+                if (c.name == ARCHIVE_CATEGORY_NAME or
+                    c.name == UNREADABLE_CATEGORY_NAME or
+                    (c.name.startswith(f"{UNREADABLE_CATEGORY_NAME} (") and c.name.endswith(")")))
+            ]
+            if special_positions:
+                try:
+                    await cat.edit(position=min(special_positions))
+                except Exception as exc:
+                    console.warning("Server mirror: could not position category '%s' above specials: %s", name, exc)
         category_cache[name] = cat
         console.info("Server mirror: created category '%s' in %s", name, dst_guild.name)
         return cat
@@ -570,6 +598,26 @@ async def _probe_forum_readable(forum: discord.ForumChannel) -> bool:
         return True  # treat transient errors as readable
 
 
+def _mirror_position_in_category(
+    src_ch: discord.abc.GuildChannel,
+    dst_category: discord.CategoryChannel,
+) -> int | None:
+    """Return a global position so dst_ch matches src_ch's relative slot in its source category."""
+    if src_ch.category is None:
+        return None
+    src_siblings = src_ch.category.channels  # already ordered: text by position, then voice/stage by position
+    rel_idx = next((i for i, c in enumerate(src_siblings) if c.id == src_ch.id), None)
+    if rel_idx is None:
+        return None
+    dst_channels = sorted(dst_category.channels, key=lambda c: c.position)
+    if not dst_channels:
+        return None
+    target_idx = min(rel_idx, len(dst_channels))
+    if target_idx < len(dst_channels):
+        return dst_channels[target_idx].position
+    return dst_channels[-1].position + 1
+
+
 async def _setup_server_mirrors(db: aiosqlite.Connection) -> None:
     if not MIRROR_SERVERS or _server_mirror_ready is None:
         return
@@ -602,9 +650,140 @@ async def _setup_server_mirrors(db: aiosqlite.Connection) -> None:
                 already_mapped = (await cur.fetchone())[0]
             if already_mapped:
                 console.info(
-                    "Server mirror: %s → %s already set up (%d channels mapped), skipping rebuild",
+                    "Server mirror: %s → %s already set up (%d channels mapped), checking for new/unreadable channels",
                     src_guild.name, dst_guild.name, already_mapped,
                 )
+                category_cache: dict[str, discord.CategoryChannel] = {}
+
+                # Which text/voice channels are already mapped and their readable state
+                async with db.execute(
+                    f"SELECT source_channel_id, unreadable FROM server_mirror_channels WHERE source_channel_id IN ({placeholders})",
+                    all_src_ids,
+                ) as cur:
+                    mapped_channels = {row[0]: row[1] for row in await cur.fetchall()}
+
+                # Which forums are already mapped
+                forum_ids = [f.id for f in src_guild.forums]
+                mapped_forums: dict[int, int] = {}
+                if forum_ids:
+                    fp = ",".join("?" * len(forum_ids))
+                    async with db.execute(
+                        f"SELECT source_forum_id, unreadable FROM server_mirror_forums WHERE source_forum_id IN ({fp})",
+                        forum_ids,
+                    ) as cur:
+                        mapped_forums = {row[0]: row[1] for row in await cur.fetchall()}
+
+                # Create mirror entries for channels added while the bot was down
+                for ch in src_guild.text_channels:
+                    if ch.id not in mapped_channels:
+                        await _ensure_server_mirror_channel(db, dst_guild, ch, category_cache)
+                        await _provision_mirror_channel_webhook(db, dst_guild, ch, category_cache)
+                for ch in src_guild.voice_channels:
+                    if ch.id not in mapped_channels:
+                        await _ensure_server_mirror_voice_channel(db, dst_guild, ch, category_cache)
+                        await _provision_mirror_channel_webhook(db, dst_guild, ch, category_cache)
+                for ch in src_guild.forums:
+                    if ch.id not in mapped_forums:
+                        await _ensure_server_mirror_forum(db, dst_guild, ch, category_cache)
+                        await _provision_mirror_forum_webhook(db, dst_guild, ch, category_cache)
+
+                # Re-probe text/voice channels marked unreadable
+                for src_ch_id, is_unreadable in mapped_channels.items():
+                    if not is_unreadable:
+                        continue
+                    src_ch = src_guild.get_channel(src_ch_id)
+                    if not isinstance(src_ch, (discord.TextChannel, discord.VoiceChannel)):
+                        continue
+                    if not await _probe_readable(src_ch):
+                        continue
+                    async with db.execute(
+                        "SELECT dest_channel_id FROM server_mirror_channels WHERE source_channel_id = ?",
+                        (src_ch_id,),
+                    ) as cur:
+                        ch_row = await cur.fetchone()
+                    if ch_row is None:
+                        continue
+                    dst_ch = dst_guild.get_channel(ch_row[0])
+                    if not isinstance(dst_ch, discord.TextChannel):
+                        continue
+                    target_cat = (
+                        await _get_or_create_category(dst_guild, src_ch.category.name, 0, category_cache)
+                        if src_ch.category else None
+                    )
+                    try:
+                        pos = _mirror_position_in_category(src_ch, target_cat) if target_cat else None
+                        if pos is not None:
+                            await dst_ch.edit(category=target_cat, position=pos)
+                        else:
+                            await dst_ch.edit(category=target_cat)
+                    except Exception as exc:
+                        console.warning("Server mirror: could not move #%s out of unreadable: %s", dst_ch.name, exc)
+                        continue
+                    try:
+                        existing_wh = await dst_ch.webhooks()
+                        wh = discord.utils.get(existing_wh, name="MessageMirror")
+                        if wh is None:
+                            wh = await dst_ch.create_webhook(name="MessageMirror")
+                        await db.execute(
+                            "UPDATE server_mirror_channels SET unreadable = 0, webhook_url = ? WHERE source_channel_id = ?",
+                            (wh.url, src_ch_id),
+                        )
+                        await db.commit()
+                        console.info("Server mirror: #%s now readable, moved to '%s' and provisioned webhook",
+                                     dst_ch.name, target_cat.name if target_cat else "no category")
+                    except Exception as exc:
+                        console.warning("Server mirror: could not provision webhook for #%s: %s", dst_ch.name, exc)
+
+                # Re-probe forums marked unreadable
+                for src_forum_id, is_unreadable in mapped_forums.items():
+                    if not is_unreadable:
+                        continue
+                    src_forum = src_guild.get_channel(src_forum_id)
+                    if not isinstance(src_forum, discord.ForumChannel):
+                        continue
+                    if not await _probe_forum_readable(src_forum):
+                        continue
+                    async with db.execute(
+                        "SELECT dest_forum_id FROM server_mirror_forums WHERE source_forum_id = ?",
+                        (src_forum_id,),
+                    ) as cur:
+                        fr_row = await cur.fetchone()
+                    if fr_row is None:
+                        continue
+                    dst_forum = dst_guild.get_channel(fr_row[0])
+                    if not isinstance(dst_forum, discord.ForumChannel):
+                        continue
+                    target_cat = (
+                        await _get_or_create_category(dst_guild, src_forum.category.name, 0, category_cache)
+                        if src_forum.category else None
+                    )
+                    try:
+                        pos = _mirror_position_in_category(src_forum, target_cat) if target_cat else None
+                        if pos is not None:
+                            await dst_forum.edit(category=target_cat, position=pos)
+                        else:
+                            await dst_forum.edit(category=target_cat)
+                    except Exception as exc:
+                        console.warning("Server mirror: could not move forum #%s out of unreadable: %s", dst_forum.name, exc)
+                        continue
+                    try:
+                        existing_wh = await dst_forum.webhooks()
+                        wh = discord.utils.get(existing_wh, name="MessageMirror")
+                        if wh is None:
+                            wh = await dst_forum.create_webhook(name="MessageMirror")
+                        await db.execute(
+                            "UPDATE server_mirror_forums SET unreadable = 0, webhook_url = ? WHERE source_forum_id = ?",
+                            (wh.url, src_forum_id),
+                        )
+                        await db.commit()
+                        console.info("Server mirror: forum #%s now readable, moved to '%s' and provisioned webhook",
+                                     dst_forum.name, target_cat.name if target_cat else "no category")
+                    except Exception as exc:
+                        console.warning("Server mirror: could not provision webhook for forum #%s: %s", dst_forum.name, exc)
+
+                await _sink_special_categories(dst_guild)
+                await _refresh_order_cache(db)
+                await _sync_channel_ordering(db)
                 continue
 
         console.info("Server mirror: setting up %s → %s (%d text, %d voice, %d forum channels)",
@@ -648,20 +827,9 @@ async def _setup_server_mirrors(db: aiosqlite.Connection) -> None:
                 except Exception as exc:
                     console.warning("Server mirror: could not delete empty category '%s': %s", cat.name, exc)
 
-        # Sort all unreadable overflow categories to the bottom in numeric order
-        unreadable_cats = sorted(
-            [c for c in dst_guild.categories if
-             c.name == UNREADABLE_CATEGORY_NAME or
-             (c.name.startswith(f"{UNREADABLE_CATEGORY_NAME} (") and c.name.endswith(")"))],
-            key=lambda c: 0 if c.name == UNREADABLE_CATEGORY_NAME
-            else int(c.name[len(UNREADABLE_CATEGORY_NAME) + 2:-1]),
-        )
-        total_cats = len(dst_guild.categories)
-        for i, cat in enumerate(unreadable_cats):
-            try:
-                await cat.edit(position=total_cats - len(unreadable_cats) + i)
-            except Exception as exc:
-                console.warning("Server mirror: could not reposition '%s': %s", cat.name, exc)
+        await _sink_special_categories(dst_guild)
+        await _refresh_order_cache(db)
+        await _sync_channel_ordering(db)
 
         async with db.execute(
             "SELECT unreadable, COUNT(*) FROM server_mirror_channels GROUP BY unreadable"
@@ -690,6 +858,216 @@ async def _setup_server_mirrors(db: aiosqlite.Connection) -> None:
 
 ARCHIVE_CATEGORY_NAME = "📁 Archived"
 UNREADABLE_CATEGORY_NAME = "🔒 Unreadable"
+
+
+async def _sink_special_categories(dst_guild: discord.Guild) -> None:
+    """Push 🔒 Unreadable and 📁 Archived categories to the bottom of the channel list."""
+    try:
+        all_channels = await dst_guild.fetch_channels()
+    except Exception as exc:
+        console.warning("Sink categories: could not fetch channels for %s: %s", dst_guild.name, exc)
+        return
+    categories = sorted(
+        [c for c in all_channels if isinstance(c, discord.CategoryChannel)],
+        key=lambda c: c.position,
+    )
+    special = [
+        c for c in categories
+        if (c.name == ARCHIVE_CATEGORY_NAME or
+            c.name == UNREADABLE_CATEGORY_NAME or
+            (c.name.startswith(f"{UNREADABLE_CATEGORY_NAME} (") and c.name.endswith(")")))
+    ]
+    if not special:
+        return
+    # Desired bottom order: Unreadable variants first, Archived last.
+    special.sort(key=lambda c: (
+        1 if c.name == ARCHIVE_CATEGORY_NAME else 0,
+        0 if c.name in (ARCHIVE_CATEGORY_NAME, UNREADABLE_CATEGORY_NAME)
+        else int(c.name[len(UNREADABLE_CATEGORY_NAME) + 2:-1]),
+    ))
+    total = len(categories)
+    # Process reversed (Archived → Unreadable) so each edit targets an absolute bottom
+    # slot without being affected by the shifts caused by prior edits.
+    for i, cat in enumerate(reversed(special)):
+        try:
+            await cat.edit(position=total - 1 - i)
+        except Exception as exc:
+            console.warning("Sink categories: could not reposition '%s': %s", cat.name, exc)
+
+
+def _build_expected_order(
+    src_guild: discord.Guild,
+    dst_guild: discord.Guild,
+    ch_map: dict[int, int],
+    forum_map: dict[int, int],
+) -> list[dict]:
+    """Derive the correct dest order from the current source guild state."""
+    result = []
+    for src_cat in sorted(src_guild.categories, key=lambda c: c.position):
+        dst_cat = discord.utils.get(dst_guild.categories, name=src_cat.name)
+        if dst_cat is None:
+            continue
+        channels: list[int] = []
+        for src_ch in src_cat.channels:  # text first, then voice/stage, each by position
+            dst_id = ch_map.get(src_ch.id) or forum_map.get(src_ch.id)
+            if dst_id is None:
+                continue
+            dst_ch = dst_guild.get_channel(dst_id)
+            if dst_ch is None or dst_ch.category_id != dst_cat.id:
+                continue
+            channels.append(dst_id)
+        result.append({"cat": src_cat.name, "channels": channels})
+    return result
+
+
+def _read_actual_order(
+    src_guild: discord.Guild,
+    dst_guild: discord.Guild,
+    all_mapped: set[int],
+) -> list[dict]:
+    """Read the actual current ordering of mapped channels in the dest guild."""
+    src_cat_names = {c.name for c in src_guild.categories}
+    result = []
+    for cat in sorted(
+        [c for c in dst_guild.categories if c.name in src_cat_names],
+        key=lambda c: c.position,
+    ):
+        channels = [
+            c.id for c in sorted(cat.channels, key=lambda c: c.position)
+            if c.id in all_mapped
+        ]
+        result.append({"cat": cat.name, "channels": channels})
+    return result
+
+
+async def _load_order_cache(
+    db: aiosqlite.Connection, src_guild_id: int, dst_guild_id: int
+) -> list[dict] | None:
+    async with db.execute(
+        "SELECT order_json FROM mirror_order_cache WHERE src_guild_id = ? AND dst_guild_id = ?",
+        (src_guild_id, dst_guild_id),
+    ) as cur:
+        row = await cur.fetchone()
+    return json.loads(row[0]) if row else None
+
+
+async def _save_order_cache(
+    db: aiosqlite.Connection, src_guild_id: int, dst_guild_id: int, order: list[dict]
+) -> None:
+    await db.execute(
+        "INSERT OR REPLACE INTO mirror_order_cache (src_guild_id, dst_guild_id, order_json) VALUES (?, ?, ?)",
+        (src_guild_id, dst_guild_id, json.dumps(order)),
+    )
+    await db.commit()
+
+
+async def _refresh_order_cache(db: aiosqlite.Connection) -> None:
+    """Rebuild the DB order cache from the current source guild state."""
+    for src_guild_id, dst_guild_id in MIRROR_SERVERS:
+        src_client = _guild_client.get(src_guild_id)
+        dst_client = _guild_client.get(dst_guild_id)
+        if src_client is None or dst_client is None:
+            continue
+        src_guild = src_client.get_guild(src_guild_id)
+        dst_guild = dst_client.get_guild(dst_guild_id)
+        if src_guild is None or dst_guild is None:
+            continue
+        if _log_poster is not None:
+            poster_dst = _log_poster.get_guild(dst_guild_id)
+            if poster_dst is not None:
+                dst_guild = poster_dst
+        async with db.execute(
+            "SELECT source_channel_id, dest_channel_id FROM server_mirror_channels"
+        ) as cur:
+            ch_map = {row[0]: row[1] for row in await cur.fetchall()}
+        async with db.execute(
+            "SELECT source_forum_id, dest_forum_id FROM server_mirror_forums"
+        ) as cur:
+            forum_map = {row[0]: row[1] for row in await cur.fetchall()}
+        expected = _build_expected_order(src_guild, dst_guild, ch_map, forum_map)
+        await _save_order_cache(db, src_guild_id, dst_guild_id, expected)
+        console.info("Order cache: refreshed for %s → %s", src_guild.name, dst_guild.name)
+
+
+async def _sync_channel_ordering(db: aiosqlite.Connection) -> None:
+    """Restore dest guild ordering to the cached correct order if it has drifted.
+
+    Uses the reverse-to-0 trick: move items in reverse desired order, each to
+    position 0; after N moves the first desired item sits at 0, second at 1, etc.
+    """
+    for src_guild_id, dst_guild_id in MIRROR_SERVERS:
+        src_client = _guild_client.get(src_guild_id)
+        dst_client = _guild_client.get(dst_guild_id)
+        if src_client is None or dst_client is None:
+            continue
+        src_guild = src_client.get_guild(src_guild_id)
+        dst_guild = dst_client.get_guild(dst_guild_id)
+        if src_guild is None or dst_guild is None:
+            continue
+
+        # Use log poster for dest edits if she's in the guild — keeps main token's activity cleaner
+        if _log_poster is not None:
+            poster_dst = _log_poster.get_guild(dst_guild_id)
+            if poster_dst is not None:
+                dst_guild = poster_dst
+
+        cached = await _load_order_cache(db, src_guild_id, dst_guild_id)
+        if cached is None:
+            console.info("Order sync: no cache for %s → %s, skipping", src_guild.name, dst_guild.name)
+            continue
+
+        async with db.execute(
+            "SELECT source_channel_id, dest_channel_id FROM server_mirror_channels"
+        ) as cur:
+            ch_map = {row[0]: row[1] for row in await cur.fetchall()}
+        async with db.execute(
+            "SELECT source_forum_id, dest_forum_id FROM server_mirror_forums"
+        ) as cur:
+            forum_map = {row[0]: row[1] for row in await cur.fetchall()}
+
+        all_mapped = set(ch_map.values()) | set(forum_map.values())
+        actual = _read_actual_order(src_guild, dst_guild, all_mapped)
+
+        if actual == cached:
+            console.info("Order sync: %s → %s unchanged, skipping", src_guild.name, dst_guild.name)
+            continue
+
+        # Restore from cache (reverse-to-0 on the cached order)
+        for entry in reversed(cached):
+            dst_cat = discord.utils.get(dst_guild.categories, name=entry["cat"])
+            if dst_cat is None:
+                continue
+            if (dst_cat.name == ARCHIVE_CATEGORY_NAME or
+                    dst_cat.name == UNREADABLE_CATEGORY_NAME or
+                    (dst_cat.name.startswith(f"{UNREADABLE_CATEGORY_NAME} (") and
+                     dst_cat.name.endswith(")"))):
+                continue
+            try:
+                await dst_cat.edit(position=0)
+                await asyncio.sleep(0.3)
+            except Exception as exc:
+                console.warning("Order sync: could not reorder category '%s': %s", entry["cat"], exc)
+
+        for entry in cached:
+            dst_cat = discord.utils.get(dst_guild.categories, name=entry["cat"])
+            if dst_cat is None:
+                continue
+            dst_chs_to_order: list[discord.abc.GuildChannel] = []
+            for dst_id in entry["channels"]:
+                dst_ch = dst_guild.get_channel(dst_id)
+                if dst_ch is None or dst_ch.category_id != dst_cat.id:
+                    continue
+                dst_chs_to_order.append(dst_ch)
+            for dst_ch in reversed(dst_chs_to_order):
+                try:
+                    await dst_ch.edit(position=0)
+                    await asyncio.sleep(0.2)
+                except Exception as exc:
+                    console.warning("Order sync: could not reorder #%s: %s", dst_ch.name, exc)
+
+        await _sink_special_categories(dst_guild)
+        console.info("Order sync: completed for %s → %s", src_guild.name, dst_guild.name)
+
 
 async def _archive_sync_worker(db: aiosqlite.Connection) -> None:
     """Every 30 minutes:
@@ -765,7 +1143,11 @@ async def _archive_sync_worker(db: aiosqlite.Connection) -> None:
                             if src_ch.category else None
                         )
                         try:
-                            await dst_ch.edit(category=target_cat)
+                            pos = _mirror_position_in_category(src_ch, target_cat) if target_cat else None
+                            if pos is not None:
+                                await dst_ch.edit(category=target_cat, position=pos)
+                            else:
+                                await dst_ch.edit(category=target_cat)
                             cat_name = target_cat.name if target_cat else "no category"
                             console.info(
                                 "Archive sync: #%s became readable, moved to '%s' in %s",
@@ -838,7 +1220,11 @@ async def _archive_sync_worker(db: aiosqlite.Connection) -> None:
                             if src_ch.category else None
                         )
                         try:
-                            await dst_ch.edit(category=target_cat)
+                            pos = _mirror_position_in_category(src_ch, target_cat) if target_cat else None
+                            if pos is not None:
+                                await dst_ch.edit(category=target_cat, position=pos)
+                            else:
+                                await dst_ch.edit(category=target_cat)
                             cat_name = target_cat.name if target_cat else "no category"
                             console.info(
                                 "Archive sync: forum #%s became readable, moved to '%s' in %s",
@@ -884,6 +1270,45 @@ async def _archive_sync_worker(db: aiosqlite.Connection) -> None:
                         console.info("Archive sync: unarchived forum #%s → '%s' in %s", dst_ch.name, cat_name, dst_guild.name)
                     except Exception as exc:
                         console.warning("Archive sync: could not unarchive forum #%s: %s", dst_ch.name, exc)
+
+            await _sink_special_categories(dst_guild)
+
+
+async def _daily_order_sync_worker(db: aiosqlite.Connection) -> None:
+    if not MIRROR_SERVERS or _server_mirror_ready is None:
+        return
+    await _server_mirror_ready.wait()
+    while True:
+        await asyncio.sleep(86400)
+        console.info("Daily order sync: starting")
+        await _sync_channel_ordering(db)
+
+
+async def _voice_summary_worker(db: aiosqlite.Connection) -> None:
+    """At midnight UTC, post yesterday's VC time per user to the log channel."""
+    while True:
+        now = datetime.now(timezone.utc)
+        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        await asyncio.sleep((next_midnight - now).total_seconds())
+
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        async with db.execute(
+            """SELECT author, SUM(duration_seconds)
+               FROM voice_sessions
+               WHERE DATE(joined_at) = ? AND duration_seconds IS NOT NULL
+               GROUP BY author
+               ORDER BY SUM(duration_seconds) DESC""",
+            (yesterday,),
+        ) as cur:
+            rows = await cur.fetchall()
+        if not rows:
+            continue
+
+        lines = [f"🎙️ Voice Activity — {yesterday}"]
+        for author, total_sec in rows:
+            lines.append(f"  {discord.utils.escape_markdown(author)}: {_fmt_duration(total_sec)}")
+        await _post_queue.put(("\n".join(lines), []))
+        console.info("Voice summary posted for %s (%d users)", yesterday, len(rows))
 
 
 # ── Client ────────────────────────────────────────────────────────────────────
@@ -1107,17 +1532,35 @@ class MessageLogger(discord.Client):
                 _log_poster = self
                 self._log_channel = ch
                 console.info("Log channel: #%s (%s) (poster: %s)", ch.name, ch.id, self.user)
+        now = datetime.now(timezone.utc)
         for guild in self.guilds:
             if _guild_owner.get(guild.id) == id(self):
                 asyncio.create_task(
                     self._check_missed_deletes_guild(guild),
                     name=f"missed-deletes-{guild.id}",
                 )
+                for vc in guild.voice_channels:
+                    for member in vc.members:
+                        key = (guild.id, member.id)
+                        if key not in _active_voice:
+                            _active_voice[key] = (vc.id, vc.name, now)
         _ready_count += 1
         if _server_mirror_ready is not None and _ready_count >= _total_clients:
             _server_mirror_ready.set()
 
     async def on_message(self, message: discord.Message) -> None:
+        if (not self._poster_only and
+                message.content.strip() == "!sync-order" and
+                self.user is not None and
+                message.author.id == self.user.id):
+            async def _refresh_and_sync(db: aiosqlite.Connection) -> None:
+                await _refresh_order_cache(db)
+                await _sync_channel_ordering(db)
+            asyncio.create_task(_refresh_and_sync(self._db), name="order-sync-cmd")
+            if self._log_channel is not None:
+                await self._log_to_channel("🔄 Channel order sync started")
+            return
+
         if not self._is_watched(message):
             return
         if self._log_channel and message.channel.id == self._log_channel.id:
@@ -1581,6 +2024,61 @@ class MessageLogger(discord.Client):
                 console.warning("Thread mirror: could not create thread '%s': %s", thread.name, exc)
             break
 
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        if not self._is_watched_guild(member.guild.id):
+            return
+        if before.channel == after.channel:
+            return  # mute/deafen/stream — not a channel change
+
+        key = (member.guild.id, member.id)
+        now = datetime.now(timezone.utc)
+        date = now.strftime("%Y-%m-%d")
+
+        if before.channel is not None and key in _active_voice:
+            chan_id, chan_name, joined_at = _active_voice.pop(key)
+            duration = (now - joined_at).total_seconds()
+            await self._db.execute(
+                """UPDATE voice_sessions SET left_at = ?, duration_seconds = ?
+                   WHERE user_id = ? AND guild_id = ? AND channel_id = ? AND left_at IS NULL""",
+                (now.isoformat(), duration, member.id, member.guild.id, chan_id),
+            )
+            await self._db.commit()
+            path = _log_path(member.guild.name, before.channel.name, date)
+            _write(path, (
+                f"[{_format_ts(now)}] [VOICE-LEAVE] {member} ({member.id}) "
+                f"in #{before.channel.name} — {_fmt_duration(duration)}\n\n"
+            ))
+            post = "\n".join([
+                f"🔇 Voice Leave",
+                f"User: {discord.utils.escape_markdown(str(member))} ({member.id})",
+                f"Channel: #{before.channel.name}  ·  {member.guild.name}",
+                f"Duration: {_fmt_duration(duration)}",
+            ])
+            await self._log_to_channel(post)
+            console.info("Voice leave: %s in #%s (%s)", member, before.channel.name, _fmt_duration(duration))
+
+        if after.channel is not None:
+            _active_voice[key] = (after.channel.id, after.channel.name, now)
+            await self._db.execute(
+                """INSERT INTO voice_sessions
+                   (user_id, author, guild_id, guild_name, channel_id, channel_name, joined_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (member.id, str(member), member.guild.id, member.guild.name,
+                 after.channel.id, after.channel.name, now.isoformat()),
+            )
+            await self._db.commit()
+            path = _log_path(member.guild.name, after.channel.name, date)
+            _write(path, (
+                f"[{_format_ts(now)}] [VOICE-JOIN] {member} ({member.id}) "
+                f"in #{after.channel.name}\n\n"
+            ))
+            console.info("Voice join: %s in #%s", member, after.channel.name)
+
     async def on_error(self, event: str, *args, **kwargs) -> None:  # type: ignore[override]
         import traceback
         console.error("Error in %s:\n%s", event, traceback.format_exc())
@@ -1809,6 +2307,28 @@ async def main() -> None:
             token_index INTEGER
         )
     """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS voice_sessions (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id          INTEGER NOT NULL,
+            author           TEXT    NOT NULL,
+            guild_id         INTEGER NOT NULL,
+            guild_name       TEXT,
+            channel_id       INTEGER NOT NULL,
+            channel_name     TEXT    NOT NULL,
+            joined_at        TEXT    NOT NULL,
+            left_at          TEXT,
+            duration_seconds REAL
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS mirror_order_cache (
+            src_guild_id INTEGER NOT NULL,
+            dst_guild_id INTEGER NOT NULL,
+            order_json   TEXT    NOT NULL,
+            PRIMARY KEY (src_guild_id, dst_guild_id)
+        )
+    """)
     # Migrations for existing DBs
     for migration in [
         "ALTER TABLE messages ADD COLUMN avatar_url TEXT",
@@ -1839,6 +2359,8 @@ async def main() -> None:
 
     server_mirror_setup = asyncio.create_task(_setup_server_mirrors(db), name="server-mirror-setup")
     archive_sync = asyncio.create_task(_archive_sync_worker(db), name="archive-sync")
+    daily_order_sync = asyncio.create_task(_daily_order_sync_worker(db), name="daily-order-sync")
+    voice_summary = asyncio.create_task(_voice_summary_worker(db), name="voice-summary")
 
     async def _start_client(client: MessageLogger, token: str) -> None:
         global _total_clients
@@ -1859,7 +2381,7 @@ async def main() -> None:
     finally:
         await asyncio.gather(*[client.close() for client in clients])
         await db.close()
-        for task in (worker, mirror_worker, server_mirror_setup, archive_sync):
+        for task in (worker, mirror_worker, server_mirror_setup, archive_sync, daily_order_sync, voice_summary):
             task.cancel()
             try:
                 await task

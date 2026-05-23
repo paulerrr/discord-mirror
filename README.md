@@ -19,9 +19,11 @@ Mirroring is opt-in and configured separately from logging. Set `MIRROR_CHANNELS
 - **Channel mirroring** — relay specific channels to webhook URLs, including edits, deletes, and reply threading (`MIRROR_CHANNELS`)
 - **Server mirroring** — replicate an entire guild's channel structure to a destination guild; channels probe for readability, unreadable ones are grouped separately, and the structure stays in sync via a periodic archive worker (`MIRROR_SERVERS`)
 - **Thread mirroring** — threads created in mirrored text channels are automatically created in the destination and kept in sync
+- **Channel ordering** — destination guild channel and category order is kept in sync with the source; the correct order is cached in the DB and restored automatically if it drifts
 
 ### General
 - **Multi-account** — multiple user tokens can be provided; each claims guilds and shares one DB
+- **Log poster token** — `LOG_POSTER_TOKEN` offloads log channel posts and dest guild edits to a separate account, keeping the main token's activity pattern cleaner
 
 ## Setup
 
@@ -42,7 +44,7 @@ WATCHED_GUILDS=
 
 # Optional: post edit/delete summaries to this channel
 LOG_CHANNEL_ID=
-# Optional: use a separate token for log channel posts
+# Optional: use a separate token for log channel posts and dest guild edits
 LOG_POSTER_TOKEN=
 
 # Optional: mirror individual channels to webhook URLs
@@ -75,9 +77,18 @@ On first run, the bot:
 2. Recreates the full channel/category structure from the source
 3. Probes each channel for readability, creates a `MessageMirror` webhook in each readable channel
 4. Moves unreadable channels to a `🔒 Unreadable` category
+5. Syncs channel and category order to match the source
 
 On subsequent restarts, if channels are already mapped in the DB the rebuild is skipped entirely.
 
 Every 30 minutes an archive sync worker re-checks for channels that have disappeared (moved to `📁 Archived`) or become newly readable (webhook provisioned, moved to proper category).
 
 New channels and threads created after initial setup are picked up automatically via `on_guild_channel_create` and `on_thread_create`.
+
+### Channel ordering
+
+The correct order is derived from the source guild and cached in `data/cache.db`. On startup and once daily, the bot compares the cached order against the actual dest guild state — if nothing has drifted, no API calls are made. If the order has changed, it is restored automatically.
+
+Send `!sync-order` as the main account to force a re-sync from the source immediately.
+
+`🔒 Unreadable` and `📁 Archived` categories are always kept at the bottom regardless of source ordering.
