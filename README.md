@@ -87,8 +87,14 @@ New channels and threads created after initial setup are picked up automatically
 
 ### Channel ordering
 
-The correct order is derived from the source guild and cached in `data/cache.db`. On startup and once daily, the bot compares the cached order against the actual dest guild state — if nothing has drifted, no API calls are made. If the order has changed, it is restored automatically.
+The correct order is derived from the source guild and cached in `data/cache.db`. On startup and once daily the bot:
 
-Send `!sync-order` as the main account to force a re-sync from the source immediately.
+1. Re-reads the source guild's current order and updates the cache if anything changed
+2. Compares the cache to the actual dest guild state
+3. If both match — nothing happens, no API calls are made
+4. If the dest has drifted from the cache — it is restored
+5. If the source changed — the cache is updated and the dest is brought in line
+
+Send `!sync-order` as the main account to trigger this immediately on demand.
 
 `🔒 Unreadable` and `📁 Archived` categories are always kept at the bottom regardless of source ordering.
