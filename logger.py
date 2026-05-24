@@ -1657,6 +1657,58 @@ class MessageLogger(discord.Client):
                 await message.channel.send("\n".join(lines))
             return
 
+        if message.content.strip().startswith("!member "):
+            query = message.content.strip()[len("!member "):].strip()
+            if query.isdigit():
+                lookup_sql = "mp.user_id = ?"
+                lookup_val = int(query)
+            else:
+                lookup_sql = "mp.username LIKE ? OR mp.display_name LIKE ?"
+                lookup_val = f"%{query}%"
+
+            args = (lookup_val,) if query.isdigit() else (lookup_val, lookup_val)
+            async with self._db.execute(
+                f"""SELECT mp.user_id, mp.username, mp.display_name, mp.avatar_url, mp.bio,
+                           SUM(vs.duration_seconds), COUNT(vs.id),
+                           MIN(vs.joined_at), MAX(vs.joined_at)
+                    FROM member_profiles mp
+                    LEFT JOIN voice_sessions vs ON vs.user_id = mp.user_id
+                    WHERE {lookup_sql}
+                    GROUP BY mp.user_id
+                    LIMIT 1""",
+                args,
+            ) as cur:
+                row = await cur.fetchone()
+
+            if not row:
+                await message.channel.send(f"No profile found for `{query}`.")
+            else:
+                uid, username, display_name, avatar_url, bio, total_sec, sessions, first_seen, last_seen = row
+                name = display_name or username
+                lines = [f"👤 **{discord.utils.escape_markdown(name)}** (`{username}` · {uid})"]
+                if bio:
+                    lines.append(f"Bio: {bio}")
+                if total_sec:
+                    lines.append(f"VC Time: **{_fmt_duration(total_sec)}** across {sessions} session{'s' if sessions != 1 else ''}")
+                    async with self._db.execute(
+                        """SELECT channel_name, SUM(duration_seconds) as t
+                           FROM voice_sessions
+                           WHERE user_id = ? AND duration_seconds IS NOT NULL
+                           GROUP BY channel_name ORDER BY t DESC LIMIT 5""",
+                        (uid,),
+                    ) as cur2:
+                        ch_rows = await cur2.fetchall()
+                    if ch_rows:
+                        ch_parts = ", ".join(f"#{r[0]} ({_fmt_duration(r[1])})" for r in ch_rows)
+                        lines.append(f"Channels: {ch_parts}")
+                    first_dt = datetime.fromisoformat(first_seen).strftime("%Y-%m-%d")
+                    last_dt = datetime.fromisoformat(last_seen).strftime("%Y-%m-%d")
+                    lines.append(f"First seen: {first_dt}  ·  Last seen: {last_dt}")
+                else:
+                    lines.append("No voice sessions recorded yet.")
+                await message.channel.send("\n".join(lines))
+            return
+
         if not self._is_watched(message):
             return
         if self._log_channel and message.channel.id == self._log_channel.id:
