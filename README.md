@@ -41,7 +41,9 @@ Mirroring is opt-in and configured separately from logging. Set `MIRROR_CHANNELS
 
 ### General
 - **Multi-account** — multiple user tokens can be provided; each claims guilds and shares one DB
-- **Log poster token** — `LOG_POSTER_TOKEN` offloads log channel posts and dest guild edits to a separate account, keeping the main token's activity pattern cleaner
+- **Log poster token** — offloads log channel posts to a separate account, keeping the main token's activity pattern cleaner. Two options:
+  - `LOG_POSTER_BOT_TOKEN` — a legitimate Discord bot token (recommended); the bot connects via REST only, no WebSocket
+  - `LOG_POSTER_TOKEN` — a secondary user account token; used as fallback when `LOG_POSTER_BOT_TOKEN` is not set. `LOG_POSTER_BOT_TOKEN` takes priority if both are set.
 
 ## Setup
 
@@ -62,7 +64,12 @@ WATCHED_GUILDS=
 
 # Optional: post edit/delete summaries to this channel
 LOG_CHANNEL_ID=
-# Optional: use a separate token for log channel posts and dest guild edits
+# Optional: legitimate Discord bot token for posting to LOG_CHANNEL_ID (recommended)
+# The bot only needs Send Messages + Attach Files in the log channel.
+# Takes priority over LOG_POSTER_TOKEN if both are set.
+LOG_POSTER_BOT_TOKEN=
+# Optional: secondary user account token for posting to LOG_CHANNEL_ID
+# Used only when LOG_POSTER_BOT_TOKEN is not set.
 LOG_POSTER_TOKEN=
 
 # Optional: mirror individual channels to webhook URLs

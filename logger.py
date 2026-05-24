@@ -33,6 +33,7 @@ LOG_CHANNEL_ID: int | None = (
 )
 
 LOG_POSTER_TOKEN: str | None = os.environ.get("LOG_POSTER_TOKEN", "").strip() or None
+LOG_POSTER_BOT_TOKEN: str | None = os.environ.get("LOG_POSTER_BOT_TOKEN", "").strip() or None
 
 MIRROR_MAP: dict[int, list[str]] = {}
 for _pair in os.environ.get("MIRROR_CHANNELS", "").split(","):
@@ -1287,6 +1288,144 @@ async def _daily_order_sync_worker(db: aiosqlite.Connection) -> None:
         await _sync_channel_ordering(db)
 
 
+class BotPoster:
+    """REST-only poster that uses a legitimate Discord bot token.
+
+    No WebSocket connection — all operations are plain HTTP calls to the
+    Discord API with `Authorization: Bot <token>`.  The only guarantee is
+    that it can post text/files to the configured log channel.  Mirror
+    guild management continues to be handled by the user-token clients.
+    """
+
+    def __init__(self, db: aiosqlite.Connection) -> None:
+        self._db = db
+        self._session: aiohttp.ClientSession | None = None
+        self._log_channel_id: int | None = LOG_CHANNEL_ID
+        # Compatibility stub — code that does `_log_poster.get_guild(...)` already
+        # handles None gracefully, so this is safe.
+        self._poster_only = True
+
+    def get_guild(self, guild_id: int) -> None:
+        return None
+
+    async def send(self, channel_id: int, content: str) -> None:
+        if not self._session:
+            return
+        url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+        while content:
+            if len(content) <= 2000:
+                try:
+                    await self._session.post(url, json={"content": content})
+                except Exception as exc:
+                    console.warning("BotPoster.send: %s", exc)
+                break
+            split_at = content.rfind("\n", 0, 2000)
+            if split_at == -1:
+                split_at = 2000
+            try:
+                await self._session.post(url, json={"content": content[:split_at]})
+            except Exception as exc:
+                console.warning("BotPoster.send: %s", exc)
+            content = content[split_at:].lstrip("\n")
+
+    async def _send_chunked(self, text: str, files: list) -> None:
+        if not self._log_channel_id or not self._session:
+            return
+        url = f"https://discord.com/api/v10/channels/{self._log_channel_id}/messages"
+
+        chunks: list[str] = []
+        while text:
+            if len(text) <= 2000:
+                chunks.append(text)
+                break
+            split_at = text.rfind("\n", 0, 2000)
+            if split_at == -1:
+                split_at = 2000
+            chunks.append(text[:split_at])
+            text = text[split_at:].lstrip("\n")
+
+        for i, chunk in enumerate(chunks):
+            chunk_files = files if i == len(chunks) - 1 else []
+            try:
+                if chunk_files:
+                    form = aiohttp.FormData()
+                    form.add_field(
+                        "payload_json",
+                        json.dumps({"content": chunk}),
+                        content_type="application/json",
+                    )
+                    for j, f in enumerate(chunk_files):
+                        f.fp.seek(0)
+                        form.add_field(
+                            f"files[{j}]",
+                            f.fp.read(),
+                            filename=f.filename,
+                            content_type="application/octet-stream",
+                        )
+                    await self._session.post(url, data=form)
+                else:
+                    await self._session.post(url, json={"content": chunk})
+            except Exception as exc:
+                console.warning("BotPoster: send failed: %s", exc)
+
+    async def start(self, token: str) -> None:
+        global _log_poster, _ready_count
+        self._session = aiohttp.ClientSession(
+            headers={"Authorization": f"Bot {token}"}
+        )
+        try:
+            async with self._session.get("https://discord.com/api/v10/users/@me") as resp:
+                if resp.status == 401:
+                    raise discord.LoginFailure("BotPoster: invalid bot token")
+                if resp.status != 200:
+                    raise discord.LoginFailure(f"BotPoster: unexpected status {resp.status} during login")
+                data = await resp.json()
+        except discord.LoginFailure:
+            raise
+        except Exception as exc:
+            raise discord.LoginFailure(f"BotPoster: login check failed: {exc}") from exc
+
+        user_id = int(data["id"])
+        username = data.get("username", "")
+        avatar_hash = data.get("avatar")
+        avatar_url = (
+            f"https://cdn.discordapp.com/avatars/{user_id}/{avatar_hash}.png"
+            if avatar_hash else ""
+        )
+        await self._db.execute(
+            """INSERT OR REPLACE INTO accounts
+               (user_id, username, avatar_url, token, poster_only, token_index)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (user_id, username, avatar_url, f"Bot {token}", True, None),
+        )
+        await self._db.commit()
+
+        console.info("BotPoster: logged in as %s (id: %s)", username, user_id)
+        _log_poster = self
+        _ready_count += 1
+        if _server_mirror_ready is not None and _ready_count >= _total_clients:
+            _server_mirror_ready.set()
+
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            pass
+
+    async def close(self) -> None:
+        if self._session:
+            await self._session.close()
+            self._session = None
+
+
+async def _cmd_reply(message: "discord.Message", text: str) -> None:
+    """Send a command response via the bot token when available, else via the self-bot."""
+    if isinstance(_log_poster, BotPoster):
+        await _log_poster.send(message.channel.id, text)
+    else:
+        await message.channel.send(text)
+
+
 async def _fetch_member_profile(
     db: aiosqlite.Connection,
     session: aiohttp.ClientSession,
@@ -1503,6 +1642,13 @@ class MessageLogger(discord.Client):
         ]
         await self._log_to_channel("\n".join(post_lines), files=files)
         await self._db.execute("DELETE FROM messages WHERE id = ?", (cached.id,))
+        await self._db.execute(
+            """INSERT INTO message_counts (author_id, author, count, deleted_count, first_seen)
+               VALUES (?, ?, 0, 1, ?)
+               ON CONFLICT(author_id) DO UPDATE SET
+                   deleted_count = deleted_count + 1, author = excluded.author""",
+            (cached.author_id, cached.author, cached.created_at.isoformat()),
+        )
         await self._db.commit()
         console.info("Missed delete: %s in %s", cached.author, channel_label)
 
@@ -1578,7 +1724,7 @@ class MessageLogger(discord.Client):
         if self._poster_only:
             for guild in self.guilds:
                 _guild_client.setdefault(guild.id, self)
-            if LOG_CHANNEL_ID:
+            if LOG_CHANNEL_ID and _log_poster is None:
                 ch = self.get_channel(LOG_CHANNEL_ID)
                 if isinstance(ch, discord.TextChannel):
                     _log_poster = self
@@ -1642,7 +1788,7 @@ class MessageLogger(discord.Client):
             ) as cur:
                 rows = await cur.fetchall()
             if not rows:
-                await message.channel.send("No voice session data yet.")
+                await _cmd_reply(message,"No voice session data yet.")
             else:
                 async with self._db.execute("SELECT MIN(joined_at) FROM voice_sessions") as cur:
                     first_row = await cur.fetchone()
@@ -1654,7 +1800,7 @@ class MessageLogger(discord.Client):
                 for i, (_uid, author, total_sec, display_name, sessions) in enumerate(rows, 1):
                     name = discord.utils.escape_markdown(display_name or author)
                     lines.append(f"{i}. {name} — {_fmt_duration(total_sec)} ({sessions} session{'s' if sessions != 1 else ''})")
-                await message.channel.send("\n".join(lines))
+                await _cmd_reply(message,"\n".join(lines))
             return
 
         if message.content.strip().startswith("!member "):
@@ -1681,7 +1827,7 @@ class MessageLogger(discord.Client):
                 row = await cur.fetchone()
 
             if not row:
-                await message.channel.send(f"No profile found for `{query}`.")
+                await _cmd_reply(message,f"No profile found for `{query}`.")
             else:
                 uid, username, display_name, avatar_url, bio, total_sec, sessions, first_seen, last_seen = row
                 name = display_name or username
@@ -1752,7 +1898,7 @@ class MessageLogger(discord.Client):
                     lines.append(f"First seen: {first_dt}  ·  Last seen: {last_dt}")
                 else:
                     lines.append("No voice sessions recorded yet.")
-                await message.channel.send("\n".join(lines))
+                await _cmd_reply(message,"\n".join(lines))
             return
 
         if message.content.strip() == "!vc-today":
@@ -1770,19 +1916,19 @@ class MessageLogger(discord.Client):
             ) as cur:
                 rows = await cur.fetchall()
             if not rows:
-                await message.channel.send(f"No voice activity today ({today}) yet.")
+                await _cmd_reply(message,f"No voice activity today ({today}) yet.")
             else:
                 lines = [f"🎙️ **Voice Activity — {today}**"]
                 for i, (_uid, author, total_sec, display_name, sessions) in enumerate(rows, 1):
                     name = discord.utils.escape_markdown(display_name or author)
                     lines.append(f"{i}. {name} — {_fmt_duration(total_sec)} ({sessions} session{'s' if sessions != 1 else ''})")
-                await message.channel.send("\n".join(lines))
+                await _cmd_reply(message,"\n".join(lines))
             return
 
         if message.content.strip().startswith("!vc-channel"):
             ch_query = message.content.strip()[len("!vc-channel"):].strip()
             if not ch_query:
-                await message.channel.send("Usage: `!vc-channel <channel name>`")
+                await _cmd_reply(message,"Usage: `!vc-channel <channel name>`")
                 return
             async with self._db.execute(
                 """SELECT vs.user_id, vs.author, SUM(vs.duration_seconds),
@@ -1797,7 +1943,7 @@ class MessageLogger(discord.Client):
             ) as cur:
                 rows = await cur.fetchall()
             if not rows:
-                await message.channel.send(f"No voice data found for channel matching `{ch_query}`.")
+                await _cmd_reply(message,f"No voice data found for channel matching `{ch_query}`.")
             else:
                 async with self._db.execute(
                     "SELECT channel_name FROM voice_sessions WHERE channel_name LIKE ? LIMIT 1",
@@ -1809,13 +1955,13 @@ class MessageLogger(discord.Client):
                 for i, (_uid, author, total_sec, display_name, sessions) in enumerate(rows, 1):
                     name = discord.utils.escape_markdown(display_name or author)
                     lines.append(f"{i}. {name} — {_fmt_duration(total_sec)} ({sessions} session{'s' if sessions != 1 else ''})")
-                await message.channel.send("\n".join(lines))
+                await _cmd_reply(message,"\n".join(lines))
             return
 
         if message.content.strip().startswith("!vc-history"):
             hist_query = message.content.strip()[len("!vc-history"):].strip()
             if not hist_query:
-                await message.channel.send("Usage: `!vc-history <name or user ID>`")
+                await _cmd_reply(message,"Usage: `!vc-history <name or user ID>`")
                 return
             if hist_query.isdigit():
                 uid_sql = "user_id = ?"
@@ -1832,19 +1978,19 @@ class MessageLogger(discord.Client):
             ) as cur:
                 rows = await cur.fetchall()
             if not rows:
-                await message.channel.send(f"No voice history found for `{hist_query}`.")
+                await _cmd_reply(message,f"No voice history found for `{hist_query}`.")
             else:
                 name = discord.utils.escape_markdown(rows[0][0])
                 lines = [f"🎙️ **{name} — Recent VC sessions**"]
                 for author, ch, joined, left, dur in rows:
                     date = datetime.fromisoformat(joined).strftime("%Y-%m-%d")
                     lines.append(f"  {date} · #{ch} · {_fmt_duration(dur)}")
-                await message.channel.send("\n".join(lines))
+                await _cmd_reply(message,"\n".join(lines))
             return
 
         if message.content.strip() == "!top-posters":
             async with self._db.execute(
-                """SELECT mc.author_id, mc.author, mc.count, mc.first_seen,
+                """SELECT mc.author_id, mc.author, mc.count, mc.deleted_count, mc.first_seen,
                           mp.display_name
                    FROM message_counts mc
                    LEFT JOIN member_profiles mp ON mp.user_id = mc.author_id
@@ -1853,7 +1999,7 @@ class MessageLogger(discord.Client):
             ) as cur:
                 rows = await cur.fetchall()
             if not rows:
-                await message.channel.send("No message data yet.")
+                await _cmd_reply(message,"No message data yet.")
             else:
                 async with self._db.execute("SELECT MIN(first_seen) FROM message_counts") as cur:
                     first_row = await cur.fetchone()
@@ -1861,10 +2007,11 @@ class MessageLogger(discord.Client):
                 if first_row and first_row[0]:
                     since = f" (since {datetime.fromisoformat(first_row[0]).strftime('%Y-%m-%d')})"
                 lines = [f"💬 **Top Posters**{since}"]
-                for i, (_uid, author, msgs, _first, display_name) in enumerate(rows, 1):
+                for i, (_uid, author, msgs, deleted, _first, display_name) in enumerate(rows, 1):
                     name = discord.utils.escape_markdown(display_name or author)
-                    lines.append(f"{i}. {name} — {msgs:,} messages")
-                await message.channel.send("\n".join(lines))
+                    deleted_str = f" ({deleted:,} deleted)" if deleted else ""
+                    lines.append(f"{i}. {name} — {msgs:,} messages{deleted_str}")
+                await _cmd_reply(message,"\n".join(lines))
             return
 
         if message.content.strip() == "!stats":
@@ -1890,7 +2037,7 @@ class MessageLogger(discord.Client):
             else:
                 lines.append("Voice sessions: 0")
             lines.append(f"Profiles cached: **{total_profiles}**")
-            await message.channel.send("\n".join(lines))
+            await _cmd_reply(message,"\n".join(lines))
             return
 
         if message.content.strip() == "!help":
@@ -1905,7 +2052,7 @@ class MessageLogger(discord.Client):
                 "`!stats` — server-wide summary",
                 "`!sync-order` — re-sync mirror channel ordering",
             ]
-            await message.channel.send("\n".join(lines))
+            await _cmd_reply(message,"\n".join(lines))
             return
 
         if not self._is_watched(message):
@@ -2186,6 +2333,14 @@ class MessageLogger(discord.Client):
         if mirror_urls:
             await self._db.commit()
 
+        await self._db.execute(
+            """INSERT INTO message_counts (author_id, author, count, deleted_count, first_seen)
+               VALUES (?, ?, 0, 1, ?)
+               ON CONFLICT(author_id) DO UPDATE SET
+                   deleted_count = deleted_count + 1, author = excluded.author""",
+            (cached.author_id, cached.author, cached.created_at.isoformat()),
+        )
+        await self._db.commit()
         console.info("Delete logged: %s in %s", cached.author, channel_label)
 
     async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
@@ -2244,6 +2399,17 @@ class MessageLogger(discord.Client):
                 )
             log_lines.append("\n")
             _write(path, "".join(log_lines))
+
+        for author_str, author_id, _, _ in entries:
+            if author_id:
+                await self._db.execute(
+                    """INSERT INTO message_counts (author_id, author, count, deleted_count, first_seen)
+                       VALUES (?, ?, 0, 1, ?)
+                       ON CONFLICT(author_id) DO UPDATE SET
+                           deleted_count = deleted_count + 1, author = excluded.author""",
+                    (author_id, author_str, datetime.now(timezone.utc).isoformat()),
+                )
+        await self._db.commit()
 
         post_lines = [
             f"🗑️ Bulk Delete ({len(payload.message_ids)} messages)",
@@ -2681,10 +2847,11 @@ async def main() -> None:
     """)
     await db.execute("""
         CREATE TABLE IF NOT EXISTS message_counts (
-            author_id  INTEGER PRIMARY KEY,
-            author     TEXT    NOT NULL,
-            count      INTEGER NOT NULL DEFAULT 0,
-            first_seen TEXT    NOT NULL
+            author_id     INTEGER PRIMARY KEY,
+            author        TEXT    NOT NULL,
+            count         INTEGER NOT NULL DEFAULT 0,
+            deleted_count INTEGER NOT NULL DEFAULT 0,
+            first_seen    TEXT    NOT NULL
         )
     """)
     await db.execute("""
@@ -2712,6 +2879,7 @@ async def main() -> None:
         "ALTER TABLE mirror_queue ADD COLUMN reply_to INTEGER",
         "ALTER TABLE server_mirror_channels ADD COLUMN unreadable INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE server_mirror_forums ADD COLUMN unreadable INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE message_counts ADD COLUMN deleted_count INTEGER NOT NULL DEFAULT 0",
     ]:
         try:
             await db.execute(migration)
@@ -2728,6 +2896,11 @@ async def main() -> None:
     tokens: list[str] = list(TOKENS)
     _total_clients = len(clients)
     _server_mirror_ready = asyncio.Event()
+
+    bot_poster: BotPoster | None = None
+    if LOG_POSTER_BOT_TOKEN:
+        bot_poster = BotPoster(db)
+        _total_clients += 1
     if LOG_POSTER_TOKEN:
         clients.append(MessageLogger(db, poster_only=True))
         tokens.append(LOG_POSTER_TOKEN)
@@ -2749,13 +2922,27 @@ async def main() -> None:
             if _server_mirror_ready is not None and _ready_count >= _total_clients:
                 _server_mirror_ready.set()
 
+    async def _start_bot_poster() -> None:
+        global _total_clients
+        if bot_poster is None or not LOG_POSTER_BOT_TOKEN:
+            return
+        try:
+            await bot_poster.start(LOG_POSTER_BOT_TOKEN)
+        except (discord.LoginFailure, discord.HTTPException) as exc:
+            console.error("BotPoster: login failed, skipping: %s", exc)
+            _total_clients -= 1
+            if _server_mirror_ready is not None and _ready_count >= _total_clients:
+                _server_mirror_ready.set()
+
     try:
-        await asyncio.gather(*[
-            _start_client(client, token)
-            for client, token in zip(clients, tokens)
-        ])
+        coros = [_start_client(c, t) for c, t in zip(clients, tokens)]
+        if bot_poster is not None:
+            coros.append(_start_bot_poster())
+        await asyncio.gather(*coros)
     finally:
         await asyncio.gather(*[client.close() for client in clients])
+        if bot_poster is not None:
+            await bot_poster.close()
         await db.close()
         for task in (worker, mirror_worker, server_mirror_setup, archive_sync, daily_order_sync, voice_summary):
             task.cancel()
