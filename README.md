@@ -34,16 +34,16 @@ Mirroring is opt-in and configured separately from logging. Set `MIRROR_CHANNELS
 | `!vc-channel <name>` | Leaderboard for a specific voice channel |
 | `!vc-history <name or ID>` | Last 15 sessions for a user |
 | `!member <name or ID>` | Profile, VC rank, avg/longest session, messages per day |
-| `!top-posters` | Most messages sent (includes deleted messages) |
+| `!top-posters` | Most messages sent; shows deleted count per user where non-zero |
 | `!stats` | Server-wide summary: messages, VC hours, profiles cached |
 | `!sync-order` | Re-sync mirror channel ordering |
 | `!help` | Lists all commands |
 
 ### General
 - **Multi-account** — multiple user tokens can be provided; each claims guilds and shares one DB
-- **Log poster token** — offloads log channel posts to a separate account, keeping the main token's activity pattern cleaner. Two options:
-  - `LOG_POSTER_BOT_TOKEN` — a legitimate Discord bot token (recommended); the bot connects via REST only, no WebSocket
-  - `LOG_POSTER_TOKEN` — a secondary user account token; used as fallback when `LOG_POSTER_BOT_TOKEN` is not set. `LOG_POSTER_BOT_TOKEN` takes priority if both are set.
+- **Log poster token** — offloads log channel posts and all command replies to a dedicated account, keeping the main token's activity pattern cleaner. Two options (can be set together):
+  - `LOG_POSTER_BOT_TOKEN` — a legitimate Discord bot token (recommended); connects via REST only, no WebSocket. Used for all command replies and log channel posts when set.
+  - `LOG_POSTER_TOKEN` — a secondary user account token. When set alongside `LOG_POSTER_BOT_TOKEN`, stays connected for guild presence and command handling in guilds the bot token can't see. When set alone, also handles posting.
 
 ## Setup
 
