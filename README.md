@@ -34,7 +34,7 @@ Mirroring is opt-in and configured separately from logging. Set `MIRROR_CHANNELS
 | `!vc-channel <name>` | Leaderboard for a specific voice channel |
 | `!vc-history <name or ID>` | Last 15 sessions for a user |
 | `!member <name or ID>` | Profile, VC rank, avg/longest session, messages per day |
-| `!top-posters` | Most messages sent (since bot started) |
+| `!top-posters` | Most messages sent (includes deleted messages) |
 | `!stats` | Server-wide summary: messages, VC hours, profiles cached |
 | `!sync-order` | Re-sync mirror channel ordering |
 | `!help` | Lists all commands |
