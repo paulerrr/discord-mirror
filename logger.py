@@ -1312,18 +1312,26 @@ class BotPoster:
         if not self._session:
             return
         url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
+        first = content.split("\n", 1)[0]
+        color = (
+            0x9B59B6 if first.startswith("🎙️") else
+            0x5865F2 if first.startswith("💬") else
+            0x3498DB if first.startswith("📊") else
+            0x2ECC71 if first.startswith("👤") else
+            0x5865F2
+        )
         while content:
-            if len(content) <= 2000:
+            if len(content) <= 4096:
                 try:
-                    await self._session.post(url, json={"content": content})
+                    await self._session.post(url, json={"embeds": [{"description": content, "color": color}]})
                 except Exception as exc:
                     console.warning("BotPoster.send: %s", exc)
                 break
-            split_at = content.rfind("\n", 0, 2000)
+            split_at = content.rfind("\n", 0, 4096)
             if split_at == -1:
-                split_at = 2000
+                split_at = 4096
             try:
-                await self._session.post(url, json={"content": content[:split_at]})
+                await self._session.post(url, json={"embeds": [{"description": content[:split_at], "color": color}]})
             except Exception as exc:
                 console.warning("BotPoster.send: %s", exc)
             content = content[split_at:].lstrip("\n")
