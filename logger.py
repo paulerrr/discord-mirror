@@ -160,6 +160,8 @@ _server_mirror_ready: asyncio.Event | None = None
 # (guild_id, user_id) → (channel_id, channel_name, joined_at)
 _active_voice: dict[tuple[int, int], tuple[int, str, datetime]] = {}
 
+_profile_fetch_pending: set[int] = set()
+
 
 async def _post_worker() -> None:
     """Single consumer for log-channel posts; retries with exponential backoff."""
@@ -1285,6 +1287,67 @@ async def _daily_order_sync_worker(db: aiosqlite.Connection) -> None:
         await _sync_channel_ordering(db)
 
 
+async def _fetch_member_profile(
+    db: aiosqlite.Connection,
+    session: aiohttp.ClientSession,
+    member: discord.Member,
+    token: str,
+) -> None:
+    """Fetch and cache a member's Discord profile (bio). No-ops if cache is <7 days old."""
+    user_id = member.id
+    if user_id in _profile_fetch_pending:
+        return
+
+    async with db.execute(
+        "SELECT fetched_at FROM member_profiles WHERE user_id = ?", (user_id,)
+    ) as cur:
+        row = await cur.fetchone()
+    if row:
+        age = (datetime.now(timezone.utc) - datetime.fromisoformat(row[0])).days
+        if age < 7:
+            return
+
+    _profile_fetch_pending.add(user_id)
+    try:
+        bio = ""
+        url = f"https://discord.com/api/v10/users/{user_id}/profile"
+        for attempt in range(3):
+            try:
+                async with session.get(url, headers={"Authorization": token}) as resp:
+                    if resp.status == 429:
+                        data = await resp.json()
+                        await asyncio.sleep(float(data.get("retry_after", 5)))
+                        continue
+                    if resp.status == 200:
+                        j = await resp.json()
+                        user_obj = j.get("user") or {}
+                        bio = user_obj.get("bio") or j.get("bio") or ""
+                    # 403 (privacy) or 404 — store what we have from member object, no bio
+                    break
+            except Exception as exc:
+                console.warning("Profile fetch %s attempt %d: %s", member, attempt + 1, exc)
+                if attempt < 2:
+                    await asyncio.sleep(2 ** attempt)
+
+        await db.execute(
+            """INSERT OR REPLACE INTO member_profiles
+               (user_id, username, display_name, avatar_url, bio, fetched_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                user_id,
+                str(member),
+                member.display_name,
+                str(member.display_avatar.url),
+                bio,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        await db.commit()
+        console.info("Profile cached: %s%s", member, f" (bio: {bio[:40]!r})" if bio else "")
+    finally:
+        _profile_fetch_pending.discard(user_id)
+
+
 async def _voice_summary_worker(db: aiosqlite.Connection) -> None:
     """At midnight UTC, post yesterday's VC time per user to the log channel."""
     while True:
@@ -1294,11 +1357,13 @@ async def _voice_summary_worker(db: aiosqlite.Connection) -> None:
 
         yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
         async with db.execute(
-            """SELECT author, SUM(duration_seconds)
-               FROM voice_sessions
-               WHERE DATE(joined_at) = ? AND duration_seconds IS NOT NULL
-               GROUP BY author
-               ORDER BY SUM(duration_seconds) DESC""",
+            """SELECT vs.user_id, vs.author, SUM(vs.duration_seconds),
+                      mp.display_name, mp.bio
+               FROM voice_sessions vs
+               LEFT JOIN member_profiles mp ON mp.user_id = vs.user_id
+               WHERE DATE(vs.joined_at) = ? AND vs.duration_seconds IS NOT NULL
+               GROUP BY vs.user_id
+               ORDER BY SUM(vs.duration_seconds) DESC""",
             (yesterday,),
         ) as cur:
             rows = await cur.fetchall()
@@ -1306,8 +1371,13 @@ async def _voice_summary_worker(db: aiosqlite.Connection) -> None:
             continue
 
         lines = [f"🎙️ Voice Activity — {yesterday}"]
-        for author, total_sec in rows:
-            lines.append(f"  {discord.utils.escape_markdown(author)}: {_fmt_duration(total_sec)}")
+        for _uid, author, total_sec, display_name, bio in rows:
+            name = discord.utils.escape_markdown(display_name or author)
+            line = f"  {name}: {_fmt_duration(total_sec)}"
+            if bio:
+                short_bio = bio[:60] + ("…" if len(bio) > 60 else "")
+                line += f"\n    ↳ {short_bio}"
+            lines.append(line)
         await _post_queue.put(("\n".join(lines), []))
         console.info("Voice summary posted for %s (%d users)", yesterday, len(rows))
 
@@ -1550,16 +1620,41 @@ class MessageLogger(discord.Client):
             _server_mirror_ready.set()
 
     async def on_message(self, message: discord.Message) -> None:
-        if (not self._poster_only and
-                message.content.strip() == "!sync-order" and
-                self.user is not None and
-                message.author.id == self.user.id):
+        if message.content.strip() == "!sync-order":
             async def _refresh_and_sync(db: aiosqlite.Connection) -> None:
                 await _refresh_order_cache(db)
                 await _sync_channel_ordering(db)
             asyncio.create_task(_refresh_and_sync(self._db), name="order-sync-cmd")
             if self._log_channel is not None:
                 await self._log_to_channel("🔄 Channel order sync started")
+            return
+
+        if message.content.strip().startswith("!vc-stats"):
+            async with self._db.execute(
+                """SELECT vs.user_id, vs.author, SUM(vs.duration_seconds),
+                          mp.display_name, COUNT(*) as sessions
+                   FROM voice_sessions vs
+                   LEFT JOIN member_profiles mp ON mp.user_id = vs.user_id
+                   WHERE vs.duration_seconds IS NOT NULL
+                   GROUP BY vs.user_id
+                   ORDER BY SUM(vs.duration_seconds) DESC
+                   LIMIT 20"""
+            ) as cur:
+                rows = await cur.fetchall()
+            if not rows:
+                await message.channel.send("No voice session data yet.")
+            else:
+                async with self._db.execute("SELECT MIN(joined_at) FROM voice_sessions") as cur:
+                    first_row = await cur.fetchone()
+                since = ""
+                if first_row and first_row[0]:
+                    since_date = datetime.fromisoformat(first_row[0]).strftime("%Y-%m-%d")
+                    since = f" (tracking since {since_date})"
+                lines = [f"🎙️ **Voice Leaderboard** (all time{since})"]
+                for i, (_uid, author, total_sec, display_name, sessions) in enumerate(rows, 1):
+                    name = discord.utils.escape_markdown(display_name or author)
+                    lines.append(f"{i}. {name} — {_fmt_duration(total_sec)} ({sessions} session{'s' if sessions != 1 else ''})")
+                await message.channel.send("\n".join(lines))
             return
 
         if not self._is_watched(message):
@@ -2079,6 +2174,10 @@ class MessageLogger(discord.Client):
                 f"in #{after.channel.name}\n\n"
             ))
             console.info("Voice join: %s in #%s", member, after.channel.name)
+            asyncio.create_task(
+                _fetch_member_profile(self._db, self._session, member, TOKENS[self._token_index]),
+                name=f"profile-fetch-{member.id}",
+            )
 
     async def on_error(self, event: str, *args, **kwargs) -> None:  # type: ignore[override]
         import traceback
@@ -2320,6 +2419,16 @@ async def main() -> None:
             joined_at        TEXT    NOT NULL,
             left_at          TEXT,
             duration_seconds REAL
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS member_profiles (
+            user_id      INTEGER PRIMARY KEY,
+            username     TEXT    NOT NULL,
+            display_name TEXT,
+            avatar_url   TEXT,
+            bio          TEXT,
+            fetched_at   TEXT    NOT NULL
         )
     """)
     await db.execute("""
