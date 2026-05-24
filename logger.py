@@ -1689,7 +1689,49 @@ class MessageLogger(discord.Client):
                 if bio:
                     lines.append(f"Bio: {bio}")
                 if total_sec:
+                    # VC rank
+                    async with self._db.execute(
+                        """SELECT COUNT(*) FROM (
+                               SELECT user_id, SUM(duration_seconds) as t
+                               FROM voice_sessions WHERE duration_seconds IS NOT NULL
+                               GROUP BY user_id
+                               HAVING t > (
+                                   SELECT SUM(duration_seconds) FROM voice_sessions
+                                   WHERE user_id = ? AND duration_seconds IS NOT NULL
+                               )
+                           )""",
+                        (uid,),
+                    ) as cur2:
+                        rank_row = await cur2.fetchone()
+                    rank = (rank_row[0] + 1) if rank_row else 1
+
+                    # Longest session + avg session length
+                    async with self._db.execute(
+                        """SELECT MAX(duration_seconds), AVG(duration_seconds)
+                           FROM voice_sessions WHERE user_id = ? AND duration_seconds IS NOT NULL""",
+                        (uid,),
+                    ) as cur2:
+                        session_stats = await cur2.fetchone()
+                    longest_sec, avg_sec = session_stats if session_stats else (None, None)
+
+                    # Avg messages per day (since first message seen)
+                    async with self._db.execute(
+                        """SELECT COUNT(*), MIN(created_at) FROM messages WHERE author_id = ?""",
+                        (uid,),
+                    ) as cur2:
+                        msg_row = await cur2.fetchone()
+                    total_msgs, first_msg_at = msg_row if msg_row else (0, None)
+                    if total_msgs and first_msg_at:
+                        days = max(1, (datetime.now(timezone.utc) - datetime.fromisoformat(first_msg_at)).days)
+                        avg_msgs_day = round(total_msgs / days, 1)
+                    else:
+                        avg_msgs_day = None
+
+                    lines.append(f"VC Rank: **#{rank}**")
                     lines.append(f"VC Time: **{_fmt_duration(total_sec)}** across {sessions} session{'s' if sessions != 1 else ''}")
+                    if avg_sec:
+                        lines.append(f"Avg session: {_fmt_duration(avg_sec)}  ·  Longest: {_fmt_duration(longest_sec)}")
+
                     async with self._db.execute(
                         """SELECT channel_name, SUM(duration_seconds) as t
                            FROM voice_sessions
@@ -1701,12 +1743,172 @@ class MessageLogger(discord.Client):
                     if ch_rows:
                         ch_parts = ", ".join(f"#{r[0]} ({_fmt_duration(r[1])})" for r in ch_rows)
                         lines.append(f"Channels: {ch_parts}")
+
+                    if avg_msgs_day is not None:
+                        lines.append(f"Messages: **{total_msgs:,}** total · {avg_msgs_day}/day")
+
                     first_dt = datetime.fromisoformat(first_seen).strftime("%Y-%m-%d")
                     last_dt = datetime.fromisoformat(last_seen).strftime("%Y-%m-%d")
                     lines.append(f"First seen: {first_dt}  ·  Last seen: {last_dt}")
                 else:
                     lines.append("No voice sessions recorded yet.")
                 await message.channel.send("\n".join(lines))
+            return
+
+        if message.content.strip() == "!vc-today":
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            async with self._db.execute(
+                """SELECT vs.user_id, vs.author, SUM(vs.duration_seconds),
+                          mp.display_name, COUNT(*) as sessions
+                   FROM voice_sessions vs
+                   LEFT JOIN member_profiles mp ON mp.user_id = vs.user_id
+                   WHERE DATE(vs.joined_at) = ? AND vs.duration_seconds IS NOT NULL
+                   GROUP BY vs.user_id
+                   ORDER BY SUM(vs.duration_seconds) DESC
+                   LIMIT 20""",
+                (today,),
+            ) as cur:
+                rows = await cur.fetchall()
+            if not rows:
+                await message.channel.send(f"No voice activity today ({today}) yet.")
+            else:
+                lines = [f"🎙️ **Voice Activity — {today}**"]
+                for i, (_uid, author, total_sec, display_name, sessions) in enumerate(rows, 1):
+                    name = discord.utils.escape_markdown(display_name or author)
+                    lines.append(f"{i}. {name} — {_fmt_duration(total_sec)} ({sessions} session{'s' if sessions != 1 else ''})")
+                await message.channel.send("\n".join(lines))
+            return
+
+        if message.content.strip().startswith("!vc-channel"):
+            ch_query = message.content.strip()[len("!vc-channel"):].strip()
+            if not ch_query:
+                await message.channel.send("Usage: `!vc-channel <channel name>`")
+                return
+            async with self._db.execute(
+                """SELECT vs.user_id, vs.author, SUM(vs.duration_seconds),
+                          mp.display_name, COUNT(*) as sessions
+                   FROM voice_sessions vs
+                   LEFT JOIN member_profiles mp ON mp.user_id = vs.user_id
+                   WHERE vs.channel_name LIKE ? AND vs.duration_seconds IS NOT NULL
+                   GROUP BY vs.user_id
+                   ORDER BY SUM(vs.duration_seconds) DESC
+                   LIMIT 20""",
+                (f"%{ch_query}%",),
+            ) as cur:
+                rows = await cur.fetchall()
+            if not rows:
+                await message.channel.send(f"No voice data found for channel matching `{ch_query}`.")
+            else:
+                async with self._db.execute(
+                    "SELECT channel_name FROM voice_sessions WHERE channel_name LIKE ? LIMIT 1",
+                    (f"%{ch_query}%",),
+                ) as cur:
+                    ch_name_row = await cur.fetchone()
+                ch_label = ch_name_row[0] if ch_name_row else ch_query
+                lines = [f"🎙️ **#{ch_label} — All-time leaderboard**"]
+                for i, (_uid, author, total_sec, display_name, sessions) in enumerate(rows, 1):
+                    name = discord.utils.escape_markdown(display_name or author)
+                    lines.append(f"{i}. {name} — {_fmt_duration(total_sec)} ({sessions} session{'s' if sessions != 1 else ''})")
+                await message.channel.send("\n".join(lines))
+            return
+
+        if message.content.strip().startswith("!vc-history"):
+            hist_query = message.content.strip()[len("!vc-history"):].strip()
+            if not hist_query:
+                await message.channel.send("Usage: `!vc-history <name or user ID>`")
+                return
+            if hist_query.isdigit():
+                uid_sql = "user_id = ?"
+                uid_args: tuple = (int(hist_query),)
+            else:
+                uid_sql = "author LIKE ?"
+                uid_args = (f"%{hist_query}%",)
+            async with self._db.execute(
+                f"""SELECT author, channel_name, joined_at, left_at, duration_seconds
+                    FROM voice_sessions
+                    WHERE {uid_sql} AND duration_seconds IS NOT NULL
+                    ORDER BY joined_at DESC LIMIT 15""",
+                uid_args,
+            ) as cur:
+                rows = await cur.fetchall()
+            if not rows:
+                await message.channel.send(f"No voice history found for `{hist_query}`.")
+            else:
+                name = discord.utils.escape_markdown(rows[0][0])
+                lines = [f"🎙️ **{name} — Recent VC sessions**"]
+                for author, ch, joined, left, dur in rows:
+                    date = datetime.fromisoformat(joined).strftime("%Y-%m-%d")
+                    lines.append(f"  {date} · #{ch} · {_fmt_duration(dur)}")
+                await message.channel.send("\n".join(lines))
+            return
+
+        if message.content.strip() == "!top-posters":
+            async with self._db.execute(
+                """SELECT author_id, author, COUNT(*) as msgs
+                   FROM messages
+                   GROUP BY author_id
+                   ORDER BY msgs DESC
+                   LIMIT 20"""
+            ) as cur:
+                rows = await cur.fetchall()
+            if not rows:
+                await message.channel.send("No message data yet.")
+            else:
+                async with self._db.execute("SELECT MIN(created_at) FROM messages") as cur:
+                    first_row = await cur.fetchone()
+                since = ""
+                if first_row and first_row[0]:
+                    since = f" (since {datetime.fromisoformat(first_row[0]).strftime('%Y-%m-%d')})"
+                lines = [f"💬 **Top Posters**{since}"]
+                for i, (_uid, author, msgs) in enumerate(rows, 1):
+                    async with self._db.execute(
+                        "SELECT display_name FROM member_profiles WHERE user_id = ?", (_uid,)
+                    ) as cur2:
+                        prof = await cur2.fetchone()
+                    name = discord.utils.escape_markdown((prof[0] if prof and prof[0] else None) or author)
+                    lines.append(f"{i}. {name} — {msgs:,} messages")
+                await message.channel.send("\n".join(lines))
+            return
+
+        if message.content.strip() == "!stats":
+            async with self._db.execute("SELECT COUNT(*), COUNT(DISTINCT author_id), MIN(created_at), MAX(created_at) FROM messages") as cur:
+                msg_row = await cur.fetchone()
+            async with self._db.execute("SELECT COUNT(*), COUNT(DISTINCT user_id), SUM(duration_seconds) FROM voice_sessions WHERE duration_seconds IS NOT NULL") as cur:
+                vc_row = await cur.fetchone()
+            async with self._db.execute("SELECT COUNT(*) FROM member_profiles") as cur:
+                prof_row = await cur.fetchone()
+
+            total_msgs, unique_posters, first_msg, last_msg = msg_row
+            total_sessions, unique_vc_users, total_vc_sec = vc_row
+            total_profiles = prof_row[0]
+
+            lines = ["📊 **Server Stats**"]
+            if total_msgs:
+                since = datetime.fromisoformat(first_msg).strftime("%Y-%m-%d") if first_msg else "?"
+                lines.append(f"Messages logged: **{total_msgs:,}** from {unique_posters} users (since {since})")
+            else:
+                lines.append("Messages logged: 0")
+            if total_sessions:
+                lines.append(f"Voice sessions: **{total_sessions:,}** from {unique_vc_users} users · {_fmt_duration(total_vc_sec or 0)} total")
+            else:
+                lines.append("Voice sessions: 0")
+            lines.append(f"Profiles cached: **{total_profiles}**")
+            await message.channel.send("\n".join(lines))
+            return
+
+        if message.content.strip() == "!help":
+            lines = [
+                "**Available commands:**",
+                "`!vc-stats` — all-time voice leaderboard",
+                "`!vc-today` — today's voice activity",
+                "`!vc-channel <name>` — leaderboard for a specific voice channel",
+                "`!vc-history <name or ID>` — recent sessions for a user",
+                "`!member <name or ID>` — profile and VC stats for a user",
+                "`!top-posters` — most messages sent",
+                "`!stats` — server-wide summary",
+                "`!sync-order` — re-sync mirror channel ordering",
+            ]
+            await message.channel.send("\n".join(lines))
             return
 
         if not self._is_watched(message):

@@ -21,6 +21,24 @@ Mirroring is opt-in and configured separately from logging. Set `MIRROR_CHANNELS
 - **Thread mirroring** — threads created in mirrored text channels are automatically created in the destination and kept in sync
 - **Channel ordering** — destination guild channel and category order is kept in sync with the source; the correct order is cached in the DB and restored automatically if it drifts
 
+### Voice & member stats
+- **Voice session tracking** — every VC join and leave is recorded with timestamps and duration in `data/cache.db`
+- **Member profile caching** — on VC join the bot fetches each member's Discord profile (display name, avatar, bio) and caches it; refreshed every 7 days
+- **Daily VC summary** — at midnight UTC a summary of the day's voice activity (with display names and bios) is posted to the log channel
+- **Commands** — usable by any account in the server:
+
+| Command | Description |
+|---|---|
+| `!vc-stats` | All-time voice leaderboard |
+| `!vc-today` | Today's voice activity |
+| `!vc-channel <name>` | Leaderboard for a specific voice channel |
+| `!vc-history <name or ID>` | Last 15 sessions for a user |
+| `!member <name or ID>` | Profile, VC rank, avg/longest session, messages per day |
+| `!top-posters` | Most messages sent (since bot started) |
+| `!stats` | Server-wide summary: messages, VC hours, profiles cached |
+| `!sync-order` | Re-sync mirror channel ordering |
+| `!help` | Lists all commands |
+
 ### General
 - **Multi-account** — multiple user tokens can be provided; each claims guilds and shares one DB
 - **Log poster token** — `LOG_POSTER_TOKEN` offloads log channel posts and dest guild edits to a separate account, keeping the main token's activity pattern cleaner
