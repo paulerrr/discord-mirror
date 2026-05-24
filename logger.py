@@ -1714,9 +1714,9 @@ class MessageLogger(discord.Client):
                         session_stats = await cur2.fetchone()
                     longest_sec, avg_sec = session_stats if session_stats else (None, None)
 
-                    # Avg messages per day (since first message seen)
+                    # Avg messages per day (since first message seen, includes deleted)
                     async with self._db.execute(
-                        """SELECT COUNT(*), MIN(created_at) FROM messages WHERE author_id = ?""",
+                        """SELECT count, first_seen FROM message_counts WHERE author_id = ?""",
                         (uid,),
                     ) as cur2:
                         msg_row = await cur2.fetchone()
@@ -1844,41 +1844,38 @@ class MessageLogger(discord.Client):
 
         if message.content.strip() == "!top-posters":
             async with self._db.execute(
-                """SELECT author_id, author, COUNT(*) as msgs
-                   FROM messages
-                   GROUP BY author_id
-                   ORDER BY msgs DESC
+                """SELECT mc.author_id, mc.author, mc.count, mc.first_seen,
+                          mp.display_name
+                   FROM message_counts mc
+                   LEFT JOIN member_profiles mp ON mp.user_id = mc.author_id
+                   ORDER BY mc.count DESC
                    LIMIT 20"""
             ) as cur:
                 rows = await cur.fetchall()
             if not rows:
                 await message.channel.send("No message data yet.")
             else:
-                async with self._db.execute("SELECT MIN(created_at) FROM messages") as cur:
+                async with self._db.execute("SELECT MIN(first_seen) FROM message_counts") as cur:
                     first_row = await cur.fetchone()
                 since = ""
                 if first_row and first_row[0]:
                     since = f" (since {datetime.fromisoformat(first_row[0]).strftime('%Y-%m-%d')})"
                 lines = [f"💬 **Top Posters**{since}"]
-                for i, (_uid, author, msgs) in enumerate(rows, 1):
-                    async with self._db.execute(
-                        "SELECT display_name FROM member_profiles WHERE user_id = ?", (_uid,)
-                    ) as cur2:
-                        prof = await cur2.fetchone()
-                    name = discord.utils.escape_markdown((prof[0] if prof and prof[0] else None) or author)
+                for i, (_uid, author, msgs, _first, display_name) in enumerate(rows, 1):
+                    name = discord.utils.escape_markdown(display_name or author)
                     lines.append(f"{i}. {name} — {msgs:,} messages")
                 await message.channel.send("\n".join(lines))
             return
 
         if message.content.strip() == "!stats":
-            async with self._db.execute("SELECT COUNT(*), COUNT(DISTINCT author_id), MIN(created_at), MAX(created_at) FROM messages") as cur:
+            async with self._db.execute("SELECT SUM(count), COUNT(*), MIN(first_seen) FROM message_counts") as cur:
                 msg_row = await cur.fetchone()
             async with self._db.execute("SELECT COUNT(*), COUNT(DISTINCT user_id), SUM(duration_seconds) FROM voice_sessions WHERE duration_seconds IS NOT NULL") as cur:
                 vc_row = await cur.fetchone()
             async with self._db.execute("SELECT COUNT(*) FROM member_profiles") as cur:
                 prof_row = await cur.fetchone()
 
-            total_msgs, unique_posters, first_msg, last_msg = msg_row
+            total_msgs, unique_posters, first_msg = msg_row
             total_sessions, unique_vc_users, total_vc_sec = vc_row
             total_profiles = prof_row[0]
 
@@ -1936,6 +1933,13 @@ class MessageLogger(discord.Client):
             stk_records.append(rec)
 
         await self._cache_message(message, att_records, stk_records)
+        await self._db.execute(
+            """INSERT INTO message_counts (author_id, author, count, first_seen)
+               VALUES (?, ?, 1, ?)
+               ON CONFLICT(author_id) DO UPDATE SET count = count + 1, author = excluded.author""",
+            (message.author.id, str(message.author), message.created_at.isoformat()),
+        )
+        await self._db.commit()
 
         date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         path = _log_path(_guild_name(message), str(message.channel), date)
@@ -2673,6 +2677,14 @@ async def main() -> None:
             joined_at        TEXT    NOT NULL,
             left_at          TEXT,
             duration_seconds REAL
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS message_counts (
+            author_id  INTEGER PRIMARY KEY,
+            author     TEXT    NOT NULL,
+            count      INTEGER NOT NULL DEFAULT 0,
+            first_seen TEXT    NOT NULL
         )
     """)
     await db.execute("""
