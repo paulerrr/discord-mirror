@@ -1868,6 +1868,18 @@ class MessageLogger(discord.Client):
                         session_stats = await cur2.fetchone()
                     longest_sec, avg_sec = session_stats if session_stats else (None, None)
 
+                    longest_date = None
+                    if longest_sec:
+                        async with self._db.execute(
+                            """SELECT joined_at FROM voice_sessions
+                               WHERE user_id = ? AND duration_seconds = ?
+                               ORDER BY joined_at DESC LIMIT 1""",
+                            (uid, longest_sec),
+                        ) as cur2:
+                            ld_row = await cur2.fetchone()
+                        if ld_row:
+                            longest_date = datetime.fromisoformat(ld_row[0]).strftime("%Y-%m-%d")
+
                     # Avg messages per day (since first message seen, includes deleted)
                     async with self._db.execute(
                         """SELECT count, first_seen FROM message_counts WHERE author_id = ?""",
@@ -1884,7 +1896,10 @@ class MessageLogger(discord.Client):
                     lines.append(f"VC Rank: **#{rank}**")
                     lines.append(f"VC Time: **{_fmt_duration(total_sec)}** across {sessions} session{'s' if sessions != 1 else ''}")
                     if avg_sec:
-                        lines.append(f"Avg session: {_fmt_duration(avg_sec)}  ·  Longest: {_fmt_duration(longest_sec)}")
+                        longest_str = _fmt_duration(longest_sec)
+                        if longest_date:
+                            longest_str += f" ({longest_date})"
+                        lines.append(f"Avg session: {_fmt_duration(avg_sec)}  ·  Longest: {longest_str}")
 
                     async with self._db.execute(
                         """SELECT channel_name, SUM(duration_seconds) as t
