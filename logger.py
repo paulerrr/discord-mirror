@@ -2742,8 +2742,8 @@ async def _mirror_worker_tick(db: aiosqlite.Connection, session: aiohttp.ClientS
             ) as cur:
                 ref_row = await cur.fetchone()
             if ref_row:
-                ref_full = ref_row[1] or ""
-                ref_preview = ref_full[:100] + ("…" if len(ref_full) > 100 else "")
+                ref_full = (ref_row[1] or "").split("\n")[0]
+                ref_preview = ref_full[:300] + ("…" if len(ref_full) > 300 else "")
                 async with db.execute(
                     "SELECT jump_url FROM mirror_message_map WHERE source_message_id = ? AND webhook_url = ?",
                     (reply_to, webhook_url),
