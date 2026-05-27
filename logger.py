@@ -1308,9 +1308,9 @@ class BotPoster:
     def get_guild(self, guild_id: int) -> None:
         return None
 
-    async def send(self, channel_id: int, content: str) -> None:
+    async def send(self, channel_id: int, content: str) -> bool:
         if not self._session:
-            return
+            return False
         url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
         first = content.split("\n", 1)[0]
         color = (
@@ -1323,18 +1323,27 @@ class BotPoster:
         while content:
             if len(content) <= 4096:
                 try:
-                    await self._session.post(url, json={"embeds": [{"description": content, "color": color}]})
+                    resp = await self._session.post(url, json={"embeds": [{"description": content, "color": color}]})
+                    if resp.status not in (200, 201):
+                        console.warning("BotPoster.send: HTTP %d for channel %d", resp.status, channel_id)
+                        return False
                 except Exception as exc:
                     console.warning("BotPoster.send: %s", exc)
+                    return False
                 break
             split_at = content.rfind("\n", 0, 4096)
             if split_at == -1:
                 split_at = 4096
             try:
-                await self._session.post(url, json={"embeds": [{"description": content[:split_at], "color": color}]})
+                resp = await self._session.post(url, json={"embeds": [{"description": content[:split_at], "color": color}]})
+                if resp.status not in (200, 201):
+                    console.warning("BotPoster.send: HTTP %d for channel %d", resp.status, channel_id)
+                    return False
             except Exception as exc:
                 console.warning("BotPoster.send: %s", exc)
+                return False
             content = content[split_at:].lstrip("\n")
+        return True
 
     async def _send_chunked(self, text: str, files: list) -> None:
         if not self._log_channel_id or not self._session:
@@ -1429,9 +1438,9 @@ class BotPoster:
 async def _cmd_reply(message: "discord.Message", text: str) -> None:
     """Send a command response via the bot token when available, else via the self-bot."""
     if isinstance(_log_poster, BotPoster):
-        await _log_poster.send(message.channel.id, text)
-    else:
-        await message.channel.send(text)
+        if await _log_poster.send(message.channel.id, text):
+            return
+    await message.channel.send(text)
 
 
 async def _fetch_member_profile(
