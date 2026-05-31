@@ -3081,7 +3081,6 @@ async def _backfill_channel(
     _allowed = {
         discord.MessageType.default,
         discord.MessageType.reply,
-        discord.MessageType.application_command,
     }
 
     for msg in messages:
