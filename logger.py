@@ -163,6 +163,10 @@ _active_voice: dict[tuple[int, int], tuple[int, str, datetime]] = {}
 
 _profile_fetch_pending: set[int] = set()
 
+_backfill_active: set[int] = set()   # source channel IDs currently being backfilled
+_backfill_server_active: bool = False
+_backfill_limiters: dict = {}         # webhook_id → _WebhookBucket
+
 
 async def _post_worker() -> None:
     """Single consumer for log-channel posts; retries with exponential backoff."""
@@ -783,6 +787,21 @@ async def _setup_server_mirrors(db: aiosqlite.Connection) -> None:
                                      dst_forum.name, target_cat.name if target_cat else "no category")
                     except Exception as exc:
                         console.warning("Server mirror: could not provision webhook for forum #%s: %s", dst_forum.name, exc)
+
+                # Re-provision channels/forums that are readable but have no webhook
+                # (can happen if webhook creation failed silently on a previous run)
+                for src_ch_id, is_unreadable in mapped_channels.items():
+                    if is_unreadable:
+                        continue
+                    src_ch = src_guild.get_channel(src_ch_id)
+                    if isinstance(src_ch, (discord.TextChannel, discord.VoiceChannel)):
+                        await _provision_mirror_channel_webhook(db, dst_guild, src_ch, category_cache)
+                for src_forum_id, is_unreadable in mapped_forums.items():
+                    if is_unreadable:
+                        continue
+                    src_forum = src_guild.get_channel(src_forum_id)
+                    if isinstance(src_forum, discord.ForumChannel):
+                        await _provision_mirror_forum_webhook(db, dst_guild, src_forum, category_cache)
 
                 await _sink_special_categories(dst_guild)
                 await _refresh_order_cache(db)
@@ -2083,8 +2102,116 @@ class MessageLogger(discord.Client):
                 "`!top-posters` — most messages sent",
                 "`!stats` — server-wide summary",
                 "`!sync-order` — re-sync mirror channel ordering",
+                "`!backfill #channel [last:N | since:YYYY-MM-DD [before:YYYY-MM-DD]]` — backfill one mirrored channel",
+                "`!backfill-server [last:N | since:YYYY-MM-DD [before:YYYY-MM-DD]]` — backfill all mirrored channels",
             ]
             await _cmd_reply(message,"\n".join(lines))
+            return
+
+        if message.content.strip().startswith("!backfill-server"):
+            global _backfill_server_active
+            if _backfill_server_active:
+                await _cmd_reply(message, "❌ A server backfill is already in progress.")
+                return
+            if not MIRROR_SERVERS:
+                await _cmd_reply(message, "❌ No MIRROR_SERVERS configured.")
+                return
+            raw = message.content.strip()[len("!backfill-server"):].strip()
+            limit, after_dt, before_dt = _parse_backfill_args(raw)
+            mode_str = (
+                f"last {limit:,}" if limit else
+                f"since {after_dt.strftime('%Y-%m-%d')}" if after_dt else
+                "all history"
+            )
+            await _cmd_reply(message, f"📦 Server backfill queued ({mode_str}). Progress will be posted to the log channel.")
+            _backfill_server_active = True
+            asyncio.create_task(
+                _backfill_server_task(self._db, self._session, self,
+                                      limit=limit, after=after_dt, before=before_dt),
+                name="backfill-server",
+            )
+            return
+
+        if message.content.strip().startswith("!backfill "):
+            raw = message.content.strip()[len("!backfill "):].strip()
+            ch_target: discord.TextChannel | None = (
+                message.channel_mentions[0] if message.channel_mentions else None
+            )
+            if ch_target is not None:
+                rest = raw.replace(ch_target.mention, "").strip()
+            else:
+                parts = raw.split(None, 1)
+                name_or_id = parts[0].lstrip("#") if parts else ""
+                rest = parts[1] if len(parts) > 1 else ""
+                if message.guild:
+                    ch_target = discord.utils.get(message.guild.text_channels, name=name_or_id)
+                    if ch_target is None and name_or_id.isdigit():
+                        obj = message.guild.get_channel(int(name_or_id))
+                        if isinstance(obj, discord.TextChannel):
+                            ch_target = obj
+
+            if ch_target is None:
+                await _cmd_reply(message, "❌ Channel not found. Usage: `!backfill #channel [last:N] [since:YYYY-MM-DD]`")
+                return
+            if ch_target.id in _backfill_active:
+                await _cmd_reply(message, f"❌ #{ch_target.name} is already being backfilled.")
+                return
+
+            async with self._db.execute(
+                "SELECT webhook_url, dest_channel_id FROM server_mirror_channels "
+                "WHERE source_channel_id = ? AND webhook_url IS NOT NULL",
+                (ch_target.id,),
+            ) as cur:
+                row = await cur.fetchone()
+            webhook_url: str | None = row[0] if row else None
+            dest_thread_id: int | None = None
+            if webhook_url is None:
+                # caller may have mentioned the dest channel instead of the source
+                async with self._db.execute(
+                    "SELECT webhook_url FROM server_mirror_channels "
+                    "WHERE dest_channel_id = ? AND webhook_url IS NOT NULL",
+                    (ch_target.id,),
+                ) as cur:
+                    row = await cur.fetchone()
+                if row:
+                    webhook_url = row[0]
+            if webhook_url is None:
+                urls = MIRROR_MAP.get(ch_target.id, [])
+                if urls:
+                    webhook_url = urls[0]
+            if webhook_url is None:
+                await _cmd_reply(message, f"❌ #{ch_target.name} has no mirror webhook configured.")
+                return
+
+            limit, after_dt, before_dt = _parse_backfill_args(rest)
+            mode_str = (
+                f"last {limit:,}" if limit else
+                f"since {after_dt.strftime('%Y-%m-%d')}" if after_dt else
+                "all history"
+            )
+            await _cmd_reply(message, f"📦 Backfilling #{ch_target.name} ({mode_str})…")
+            _backfill_active.add(ch_target.id)
+
+            async def _run_backfill(
+                _ch=ch_target, _wh=webhook_url, _tid=dest_thread_id,
+                _lim=limit, _aft=after_dt, _bef=before_dt,
+            ) -> None:
+                try:
+                    sent, skipped = await _backfill_channel(
+                        _ch, _wh, _tid, self._db, self._session,
+                        limit=_lim, after=_aft, before=_bef,
+                    )
+                    await _post_queue.put((
+                        f"✅ Backfill #{_ch.name}: {sent:,} sent · {skipped:,} skipped",
+                        [],
+                    ))
+                except Exception as exc:
+                    console.error("Backfill #%s failed: %s", _ch.name, exc)
+                    await _post_queue.put((f"❌ Backfill #{_ch.name} failed: {exc}", []))
+                finally:
+                    _backfill_active.discard(_ch.id)
+
+            asyncio.create_task(_run_backfill(), name=f"backfill-{ch_target.id}")
             return
 
         if not self._is_watched(message):
@@ -2769,6 +2896,20 @@ async def _mirror_worker_tick(db: aiosqlite.Connection, session: aiohttp.ClientS
         )
         await db.commit()
         console.info("Mirrored message to %s", webhook_url[:40])
+    except discord.NotFound:
+        console.warning("Mirror: webhook gone (%s), clearing from DB", webhook_url[:40])
+        try:
+            await db.execute(
+                "UPDATE server_mirror_channels SET webhook_url = NULL WHERE webhook_url = ?",
+                (webhook_url,),
+            )
+            await db.execute(
+                "UPDATE server_mirror_forums SET webhook_url = NULL WHERE webhook_url = ?",
+                (webhook_url,),
+            )
+            await db.commit()
+        except Exception as exc:
+            console.warning("Mirror: failed to clear dead webhook from DB: %s", exc)
     except Exception as exc:
         console.warning("Mirror post to %s failed: %s", webhook_url[:40], exc)
     finally:
@@ -2777,6 +2918,319 @@ async def _mirror_worker_tick(db: aiosqlite.Connection, session: aiohttp.ClientS
             await db.commit()
         except Exception as exc:
             console.warning("Mirror worker: failed to delete queue item %s: %s", queue_id, exc)
+
+
+# ── Backfill ──────────────────────────────────────────────────────────────────
+
+class _WebhookBucket:
+    """Token-bucket rate limiter for one webhook. Discord allows 30 req/30 s."""
+    _RATE = 28    # leave 2 for headroom
+    _PER  = 30.0
+
+    def __init__(self) -> None:
+        self._tokens: float = float(self._RATE)
+        self._last:   float = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = asyncio.get_event_loop().time()
+            elapsed = now - self._last
+            self._last = now
+            self._tokens = min(
+                float(self._RATE),
+                self._tokens + elapsed * (self._RATE / self._PER),
+            )
+            if self._tokens < 1.0:
+                wait = (1.0 - self._tokens) * (self._PER / self._RATE)
+                self._tokens = 0.0
+                await asyncio.sleep(wait)
+            else:
+                self._tokens -= 1.0
+
+    def penalise(self, retry_after: float) -> None:
+        """Drain the bucket after a 429 so the next acquire waits the full penalty."""
+        self._tokens = 0.0
+
+
+def _get_backfill_limiter(webhook_url: str) -> _WebhookBucket:
+    try:
+        wh_id = webhook_url.rstrip("/").rsplit("/", 2)[-2]
+    except Exception:
+        wh_id = webhook_url
+    if wh_id not in _backfill_limiters:
+        _backfill_limiters[wh_id] = _WebhookBucket()
+    return _backfill_limiters[wh_id]
+
+
+def _parse_backfill_args(args: str) -> tuple[int | None, datetime | None, datetime | None]:
+    """Parse 'last:N', 'since:YYYY-MM-DD', 'before:YYYY-MM-DD' from a token string."""
+    limit: int | None = None
+    after_dt: datetime | None = None
+    before_dt: datetime | None = None
+    for part in args.split():
+        if part.startswith("last:"):
+            try:
+                limit = max(1, int(part[5:]))
+            except ValueError:
+                pass
+        elif part.startswith("since:"):
+            try:
+                after_dt = datetime.fromisoformat(part[6:]).replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+        elif part.startswith("before:"):
+            try:
+                before_dt = datetime.fromisoformat(part[7:]).replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+    return limit, after_dt, before_dt
+
+
+async def _backfill_send(
+    session: aiohttp.ClientSession,
+    webhook_url: str,
+    *,
+    content: str,
+    username: str,
+    avatar_url: str | None,
+    files: list[discord.File],
+    thread_id: int | None,
+    limiter: _WebhookBucket,
+) -> "discord.WebhookMessage | None":
+    """Send one webhook message with rate-limit-aware retry."""
+    for attempt in range(7):
+        await limiter.acquire()
+        try:
+            wh = discord.Webhook.from_url(webhook_url, session=session)
+            return await wh.send(
+                content=content or "​",
+                username=username,
+                avatar_url=avatar_url or discord.utils.MISSING,
+                files=files if files else discord.utils.MISSING,
+                thread=discord.Object(id=thread_id) if thread_id else discord.utils.MISSING,
+                wait=True,
+            )
+        except discord.HTTPException as exc:
+            if exc.status == 429:
+                retry_after = 5.0
+                try:
+                    retry_after = float(json.loads(exc.text).get("retry_after", 5))
+                except Exception:
+                    pass
+                limiter.penalise(retry_after)
+                console.warning("Backfill 429: sleeping %.1fs (attempt %d)", retry_after + 0.5, attempt + 1)
+                await asyncio.sleep(retry_after + 0.5)
+            elif exc.status in (500, 502, 503, 504):
+                delay = min(60.0, 1.0 * (2 ** attempt))
+                console.warning("Backfill HTTP %d: retry %d in %.1fs", exc.status, attempt + 1, delay)
+                await asyncio.sleep(delay)
+            elif exc.status == 404:
+                console.warning("Backfill: webhook not found (%s)", webhook_url[:40])
+                return None
+            else:
+                console.warning("Backfill HTTP %d on %s: %s", exc.status, webhook_url[:40], exc)
+                return None
+        except Exception as exc:
+            if attempt < 6:
+                await asyncio.sleep(min(30.0, 1.0 * (2 ** attempt)))
+                continue
+            console.warning("Backfill: send failed after retries: %s", exc)
+            return None
+    return None
+
+
+async def _backfill_channel(
+    channel: discord.TextChannel | discord.Thread,
+    webhook_url: str,
+    dest_thread_id: int | None,
+    db: aiosqlite.Connection,
+    session: aiohttp.ClientSession,
+    *,
+    limit: int | None = None,
+    after: datetime | None = None,
+    before: datetime | None = None,
+) -> tuple[int, int]:
+    """Walk channel history oldest→newest and post each message via webhook.
+
+    Returns (sent, skipped).
+    """
+    sent = 0
+    skipped = 0
+    limiter = _get_backfill_limiter(webhook_url)
+    name = getattr(channel, "name", str(channel.id))
+
+    try:
+        if limit is not None:
+            messages = [m async for m in channel.history(limit=limit, oldest_first=False)]
+            messages.reverse()
+        else:
+            kw: dict = {"limit": None, "oldest_first": True}
+            if after:
+                kw["after"] = after
+            if before:
+                kw["before"] = before
+            messages = [m async for m in channel.history(**kw)]
+    except discord.Forbidden:
+        console.warning("Backfill: no history access for #%s", name)
+        return 0, 0
+    except Exception as exc:
+        console.warning("Backfill: history fetch failed for #%s: %s", name, exc)
+        return 0, 0
+
+    _allowed = {
+        discord.MessageType.default,
+        discord.MessageType.reply,
+        discord.MessageType.application_command,
+    }
+
+    for msg in messages:
+        if msg.type not in _allowed:
+            skipped += 1
+            continue
+        if not (msg.content or msg.attachments or msg.stickers):
+            skipped += 1
+            continue
+
+        post_content = msg.content or ""
+
+        if msg.reference and msg.reference.message_id:
+            async with db.execute(
+                "SELECT author, content FROM messages WHERE id = ?",
+                (msg.reference.message_id,),
+            ) as cur:
+                ref_row = await cur.fetchone()
+            if ref_row:
+                ref_line = (ref_row[1] or "").split("\n")[0]
+                ref_preview = ref_line[:300] + ("…" if len(ref_line) > 300 else "")
+                async with db.execute(
+                    "SELECT jump_url FROM mirror_message_map "
+                    "WHERE source_message_id = ? AND webhook_url = ?",
+                    (msg.reference.message_id, webhook_url),
+                ) as cur:
+                    jump_row = await cur.fetchone()
+                if jump_row:
+                    ref_preview += f" [↗]({jump_row[0]})"
+                post_content = f"> **{ref_row[0]}**: {ref_preview}\n{post_content}"
+
+        files: list[discord.File] = []
+        extra_urls: list[str] = []
+        for att in msg.attachments:
+            try:
+                async with _download_sem:
+                    async with session.get(att.url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            if len(data) < 8 * 1024 * 1024:
+                                files.append(discord.File(io.BytesIO(data), filename=att.filename))
+                            else:
+                                extra_urls.append(att.url)
+                        else:
+                            extra_urls.append(att.url)
+            except Exception as exc:
+                console.warning("Backfill att fetch (%s): %s", att.filename, exc)
+                extra_urls.append(att.url)
+
+        for s in msg.stickers:
+            extra_urls.append(f"https://media.discordapp.net/stickers/{s.id}.webp")
+
+        if extra_urls:
+            post_content = (post_content + "\n" + "\n".join(extra_urls)).strip()
+        if len(post_content) > 2000:
+            post_content = post_content[:1997] + "…"
+
+        result = await _backfill_send(
+            session, webhook_url,
+            content=post_content,
+            username=str(msg.author),
+            avatar_url=str(msg.author.display_avatar.url),
+            files=files,
+            thread_id=dest_thread_id,
+            limiter=limiter,
+        )
+        if result is not None:
+            await db.execute(
+                "INSERT OR IGNORE INTO mirror_message_map "
+                "(source_message_id, webhook_url, jump_url) VALUES (?, ?, ?)",
+                (msg.id, webhook_url, result.jump_url),
+            )
+            await db.commit()
+            sent += 1
+        else:
+            skipped += 1
+
+    console.info("Backfill #%s: sent=%d skipped=%d", name, sent, skipped)
+    return sent, skipped
+
+
+async def _backfill_server_task(
+    db: aiosqlite.Connection,
+    session: aiohttp.ClientSession,
+    client: "MessageLogger",
+    *,
+    limit: int | None = None,
+    after: datetime | None = None,
+    before: datetime | None = None,
+) -> None:
+    global _backfill_server_active
+    try:
+        async with db.execute(
+            "SELECT source_channel_id, webhook_url, dest_channel_id "
+            "FROM server_mirror_channels WHERE webhook_url IS NOT NULL AND unreadable = 0"
+        ) as cur:
+            rows = await cur.fetchall()
+
+        total = len(rows)
+        if total == 0:
+            await _post_queue.put(("📦 Backfill: no mapped readable channels found.", []))
+            return
+
+        await _post_queue.put((f"📦 Server backfill started: {total} channel(s)", []))
+        done = 0
+        total_sent = 0
+        total_skipped = 0
+
+        for src_id, webhook_url, dest_id in rows:
+            if src_id in _backfill_active:
+                done += 1
+                continue
+            ch = client.get_channel(src_id)
+            if ch is None:
+                console.info("Backfill: channel %s not in cache, skipping", src_id)
+                done += 1
+                continue
+
+            _backfill_active.add(src_id)
+            try:
+                sent, skipped = await _backfill_channel(
+                    ch, webhook_url,
+                    dest_id if isinstance(ch, discord.Thread) else None,
+                    db, session,
+                    limit=limit, after=after, before=before,
+                )
+            finally:
+                _backfill_active.discard(src_id)
+
+            total_sent += sent
+            total_skipped += skipped
+            done += 1
+
+            if done % 10 == 0 or done == total:
+                await _post_queue.put((
+                    f"📦 Backfill: {done}/{total} channels · {total_sent:,} sent so far",
+                    [],
+                ))
+
+        await _post_queue.put((
+            f"✅ Server backfill complete: {total} channels · "
+            f"{total_sent:,} sent · {total_skipped:,} skipped",
+            [],
+        ))
+    except Exception as exc:
+        console.error("Server backfill task failed: %s", exc)
+        await _post_queue.put((f"❌ Server backfill failed: {exc}", []))
+    finally:
+        _backfill_server_active = False
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

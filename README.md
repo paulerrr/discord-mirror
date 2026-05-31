@@ -36,6 +36,8 @@ Mirroring is opt-in and configured separately from logging. Set `MIRROR_CHANNELS
 | `!member <name or ID>` | Profile, VC rank, avg/longest session, messages per day |
 | `!top-posters` | Most messages sent; shows deleted count per user where non-zero |
 | `!stats` | Server-wide summary: messages, VC hours, profiles cached |
+| `!backfill #channel [last:N \| since:YYYY-MM-DD [before:YYYY-MM-DD]]` | Backfill one mirrored channel; channel can be mentioned from either the source or mirror guild |
+| `!backfill-server [last:N \| since:YYYY-MM-DD [before:YYYY-MM-DD]]` | Backfill all mirrored channels in the server |
 | `!sync-order` | Re-sync mirror channel ordering |
 | `!help` | Lists all commands |
 
