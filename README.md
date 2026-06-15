@@ -108,7 +108,7 @@ On first run, the bot:
 
 On subsequent restarts, if channels are already mapped in the DB the rebuild is skipped entirely.
 
-Every 30 minutes an archive sync worker re-checks for channels that have disappeared (moved to `📁 Archived`) or become newly readable (webhook provisioned, moved to proper category).
+Every 30 minutes an archive sync worker re-checks for channels that have disappeared (moved to `📁 Archived`) or become newly readable (webhook provisioned, moved to proper category), and reconciles any channel names that drifted while the bot was disconnected.
 
 New channels and threads created after initial setup are picked up automatically via `on_guild_channel_create` and `on_thread_create`, and renames are propagated via `on_guild_channel_update`.
 

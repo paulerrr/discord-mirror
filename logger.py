@@ -1371,6 +1371,9 @@ async def _archive_sync_tick(db: aiosqlite.Connection) -> None:
 
         await _sink_special_categories(dst_guild)
 
+    # Self-heal any channel renames missed while disconnected.
+    await _sync_channel_names(db)
+
 
 async def _daily_order_sync_worker(db: aiosqlite.Connection) -> None:
     if not MIRROR_SERVERS or _server_mirror_ready is None:
