@@ -3081,6 +3081,21 @@ async def main() -> None:
             await db.execute(migration)
         except Exception:
             pass
+    # Indexes for the hot query paths. Created on existing data automatically;
+    # IF NOT EXISTS makes this safe to run on every startup.
+    for index in [
+        # voice_sessions: user_id leads every GROUP BY / WHERE / JOIN; the
+        # session-close UPDATE filters on user_id, guild_id, channel_id.
+        "CREATE INDEX IF NOT EXISTS idx_voice_user "
+        "ON voice_sessions(user_id, guild_id, channel_id)",
+        # message_counts: author_id is the PK; this serves !top-posters' ORDER BY.
+        "CREATE INDEX IF NOT EXISTS idx_message_counts_count "
+        "ON message_counts(count DESC)",
+        # messages: on_ready missed-delete scan filters guild_name + channel by id range.
+        "CREATE INDEX IF NOT EXISTS idx_messages_chan "
+        "ON messages(guild_name, channel, id)",
+    ]:
+        await db.execute(index)
     await db.commit()
 
     mirror_session = aiohttp.ClientSession()
