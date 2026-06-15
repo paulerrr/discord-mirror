@@ -1125,6 +1125,64 @@ async def _sync_channel_ordering(db: aiosqlite.Connection) -> None:
         console.info("Order sync: completed for %s → %s", src_guild.name, dst_guild.name)
 
 
+async def _sync_channel_names(db: aiosqlite.Connection) -> None:
+    """Rename any dest channels/forums whose name has drifted from their source."""
+    for src_guild_id, dst_guild_id in MIRROR_SERVERS:
+        src_client = _guild_client.get(src_guild_id)
+        dst_client = _guild_client.get(dst_guild_id)
+        if src_client is None or dst_client is None:
+            continue
+        src_guild = src_client.get_guild(src_guild_id)
+        dst_guild = dst_client.get_guild(dst_guild_id)
+        if src_guild is None or dst_guild is None:
+            continue
+
+        async with db.execute(
+            "SELECT source_channel_id, dest_channel_id FROM server_mirror_channels"
+        ) as cur:
+            rows = list(await cur.fetchall())
+        async with db.execute(
+            "SELECT source_forum_id, dest_forum_id FROM server_mirror_forums"
+        ) as cur:
+            rows += list(await cur.fetchall())
+
+        renamed = 0
+        for src_id, dst_id in rows:
+            src_ch = src_guild.get_channel(src_id) or src_guild.get_thread(src_id)
+            dst_ch = dst_guild.get_channel(dst_id) or dst_guild.get_thread(dst_id)
+            if src_ch is None or dst_ch is None:
+                continue
+            if src_ch.name == dst_ch.name:
+                continue
+            old_name = dst_ch.name
+            try:
+                await dst_ch.edit(name=src_ch.name)
+                renamed += 1
+                console.info("Name sync: #%s → #%s in %s", old_name, src_ch.name, dst_guild.name)
+                await asyncio.sleep(0.2)
+            except Exception as exc:
+                console.warning("Name sync: could not rename #%s → #%s: %s", old_name, src_ch.name, exc)
+
+        console.info("Name sync: completed for %s → %s (%d renamed)", src_guild.name, dst_guild.name, renamed)
+
+
+async def _sync_everything(db: aiosqlite.Connection) -> None:
+    """Full mirror reconciliation: archive state, channel names, then ordering."""
+    try:
+        await _archive_sync_tick(db)
+    except Exception as exc:
+        console.error("Full sync: archive step failed: %r", exc, exc_info=exc)
+    try:
+        await _sync_channel_names(db)
+    except Exception as exc:
+        console.error("Full sync: name step failed: %r", exc, exc_info=exc)
+    try:
+        await _refresh_order_cache(db)
+        await _sync_channel_ordering(db)
+    except Exception as exc:
+        console.error("Full sync: order step failed: %r", exc, exc_info=exc)
+
+
 async def _archive_sync_worker(db: aiosqlite.Connection) -> None:
     """Every 30 minutes:
     - Archive dest channels whose source has disappeared.
@@ -1820,6 +1878,12 @@ class MessageLogger(discord.Client):
             _server_mirror_ready.set()
 
     async def on_message(self, message: discord.Message) -> None:
+        if message.content.strip() == "!sync":
+            asyncio.create_task(_sync_everything(self._db), name="full-sync-cmd")
+            if self._log_channel is not None:
+                await self._log_to_channel("🔄 Full mirror sync started (archive, names, order)")
+            return
+
         if message.content.strip() == "!sync-order":
             async def _refresh_and_sync(db: aiosqlite.Connection) -> None:
                 await _refresh_order_cache(db)
@@ -2119,6 +2183,7 @@ class MessageLogger(discord.Client):
                 "`!member <name or ID>` — profile and VC stats for a user",
                 "`!top-posters` — most messages sent",
                 "`!stats` — server-wide summary",
+                "`!sync` — full mirror re-sync (archive, names, order)",
                 "`!sync-order` — re-sync mirror channel ordering",
             ]
             await _cmd_reply(message,"\n".join(lines))
@@ -2568,6 +2633,51 @@ class MessageLogger(discord.Client):
                             await _ensure_server_mirror_forum(self._db, dst_guild, channel, {})
                             await _provision_mirror_forum_webhook(self._db, dst_guild, channel)
                 break
+
+    async def on_guild_channel_update(
+        self,
+        before: discord.abc.GuildChannel,
+        after: discord.abc.GuildChannel,
+    ) -> None:
+        if not isinstance(after, (discord.TextChannel, discord.VoiceChannel, discord.ForumChannel)):
+            return
+        if before.name == after.name:
+            return  # only react to renames
+        for src_id, dst_id in MIRROR_SERVERS:
+            if after.guild.id != src_id:
+                continue
+            is_forum = isinstance(after, discord.ForumChannel)
+            table = "server_mirror_forums" if is_forum else "server_mirror_channels"
+            id_col = "source_forum_id" if is_forum else "source_channel_id"
+            dst_col = "dest_forum_id" if is_forum else "dest_channel_id"
+            async with self._db.execute(
+                f"SELECT {dst_col} FROM {table} WHERE {id_col} = ?",
+                (after.id,),
+            ) as cur:
+                row = await cur.fetchone()
+            if row is None:
+                return
+            dst_client = _guild_client.get(dst_id)
+            if dst_client is None:
+                return
+            dst_guild = dst_client.get_guild(dst_id)
+            if dst_guild is None:
+                return
+            dst_channel = dst_guild.get_channel(row[0])
+            if dst_channel is None:
+                return
+            try:
+                await dst_channel.edit(name=after.name)
+                console.info(
+                    "Channel rename: #%s → #%s in %s",
+                    before.name, after.name, dst_guild.name,
+                )
+            except Exception as exc:
+                console.warning(
+                    "Channel rename: could not rename #%s → #%s: %s",
+                    before.name, after.name, exc,
+                )
+            break
 
     async def on_thread_create(self, thread: discord.Thread) -> None:
         if not isinstance(thread.parent, discord.TextChannel):

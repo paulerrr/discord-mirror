@@ -19,6 +19,7 @@ Mirroring is opt-in and configured separately from logging. Set `MIRROR_CHANNELS
 - **Channel mirroring** — relay specific channels to webhook URLs, including edits, deletes, and reply threading (`MIRROR_CHANNELS`)
 - **Server mirroring** — replicate an entire guild's channel structure to a destination guild; channels probe for readability, unreadable ones are grouped separately, and the structure stays in sync via a periodic archive worker (`MIRROR_SERVERS`)
 - **Thread mirroring** — threads created in mirrored text channels are automatically created in the destination and kept in sync
+- **Channel renames** — renaming a channel, voice channel, or forum in the source updates the destination channel's name in real time
 - **Channel ordering** — destination guild channel and category order is kept in sync with the source; the correct order is cached in the DB and restored automatically if it drifts
 
 ### Voice & member stats
@@ -36,6 +37,7 @@ Mirroring is opt-in and configured separately from logging. Set `MIRROR_CHANNELS
 | `!member <name or ID>` | Profile, VC rank, avg/longest session, messages per day |
 | `!top-posters` | Most messages sent; shows deleted count per user where non-zero |
 | `!stats` | Server-wide summary: messages, VC hours, profiles cached |
+| `!sync` | Full mirror re-sync: archive state, channel names, then ordering |
 | `!sync-order` | Re-sync mirror channel ordering |
 | `!help` | Lists all commands |
 
@@ -108,7 +110,9 @@ On subsequent restarts, if channels are already mapped in the DB the rebuild is 
 
 Every 30 minutes an archive sync worker re-checks for channels that have disappeared (moved to `📁 Archived`) or become newly readable (webhook provisioned, moved to proper category).
 
-New channels and threads created after initial setup are picked up automatically via `on_guild_channel_create` and `on_thread_create`.
+New channels and threads created after initial setup are picked up automatically via `on_guild_channel_create` and `on_thread_create`, and renames are propagated via `on_guild_channel_update`.
+
+Send `!sync` as the main account to force a full reconciliation on demand — it runs the archive check, syncs any drifted channel names, then re-syncs ordering.
 
 ### Channel ordering
 
