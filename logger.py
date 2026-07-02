@@ -3,6 +3,7 @@ import asyncio
 import io
 import os
 import json
+import random
 import aiohttp
 import aiosqlite
 import logging
@@ -10,6 +11,7 @@ import logging.handlers
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import AsyncIterator
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -56,6 +58,7 @@ for _pair in os.environ.get("MIRROR_SERVERS", "").split(","):
         MIRROR_SERVERS.append((int(_src), int(_dst)))
 
 _server_mirror_src: set[int] = {s for s, _d in MIRROR_SERVERS}
+_server_mirror_dst_to_src: dict[int, int] = {d: s for s, d in MIRROR_SERVERS}
 
 BASE_LOG_DIR = Path("logs")
 MEDIA_DIR = Path("media")
@@ -1636,6 +1639,107 @@ async def _voice_summary_worker(db: aiosqlite.Connection) -> None:
         console.info("Voice summary posted for %s (%d users)", yesterday, len(rows))
 
 
+# ── Backfill (historical cache-only ingestion) ──────────────────────────────
+# Walks a mirror-source guild's full text-channel history and inserts rows
+# into `messages` only (see MessageLogger._run_guild_backfill /
+# _backfill_channel below). Paced very conservatively since this runs on a
+# self-bot account and sustained scraping-shaped request patterns are exactly
+# what risks automated-behavior detection.
+
+BACKFILL_PAGE_SIZE = 50          # messages per history() page (Discord max is 100)
+BACKFILL_PAGE_DELAY = 3.0        # seconds between pages within a channel
+BACKFILL_CHANNEL_DELAY = 10.0    # seconds between finishing one channel and starting the next
+BACKFILL_BASE_RETRY_DELAY = 2.0  # base for exponential backoff on retryable HTTP errors
+BACKFILL_MAX_RETRY_DELAY = 120.0 # cap for a single backoff sleep
+BACKFILL_RETRY_JITTER = 0.25     # + up to 25% jitter on every backoff sleep
+BACKFILL_PROGRESS_INTERVAL = 300.0  # seconds between periodic "still running" updates
+
+_active_backfills: set[int] = set()  # source guild ids with a backfill currently running
+
+
+async def _post_backfill_update(text: str, fallback_channel: "discord.abc.Messageable | None") -> None:
+    """Post a backfill status update to the log channel if one is configured,
+    otherwise fall back to the channel the command was run in."""
+    if _log_poster is not None:
+        await _post_queue.put((text, []))
+        return
+    if fallback_channel is not None:
+        try:
+            await fallback_channel.send(text)
+        except Exception as exc:
+            console.warning("Backfill: failed to post update to fallback channel: %s", exc)
+
+
+async def _backfill_progress_ticker(
+    guild: discord.Guild,
+    state: dict,
+    fallback_channel: "discord.abc.Messageable | None",
+    stop_event: asyncio.Event,
+) -> None:
+    """Posts a periodic progress update until `stop_event` is set, regardless
+    of channel boundaries — important for a single very large channel that
+    could otherwise run for hours with no visible progress."""
+    while True:
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=BACKFILL_PROGRESS_INTERVAL)
+            return  # stop_event was set
+        except asyncio.TimeoutError:
+            pass
+        await _post_backfill_update(
+            f"📼 Backfill in progress for **{guild.name}**\n"
+            f"Channel {state['channels_done']}/{state['total_channels']} "
+            f"(current: #{state['current_channel']}, {state['current_cached']:,} cached in it so far)\n"
+            f"Total messages cached this run: {state['total_cached']:,}",
+            fallback_channel,
+        )
+
+
+def _backfill_should_retry(exc: discord.HTTPException) -> bool:
+    return getattr(exc, "status", None) in {500, 502, 503, 504, 520, 522, 523, 524}
+
+
+def _backfill_retry_delay(attempt: int) -> float:
+    delay = min(BACKFILL_MAX_RETRY_DELAY, BACKFILL_BASE_RETRY_DELAY * (2 ** attempt))
+    return delay * (1.0 + random.random() * BACKFILL_RETRY_JITTER)
+
+
+async def _iter_channel_history_resumable(
+    channel: discord.TextChannel,
+    after_id: int | None,
+) -> AsyncIterator[discord.Message]:
+    """Yield a text channel's full history oldest-first, resuming from `after_id`
+    when given. Paces requests conservatively between pages and retries
+    retryable HTTP errors indefinitely with capped exponential backoff plus
+    jitter — a backfill job is expected to eventually finish, not give up.
+    """
+    cursor = discord.Object(id=after_id) if after_id else None
+    attempt = 0
+    while True:
+        try:
+            fetched_any = False
+            async for msg in channel.history(limit=BACKFILL_PAGE_SIZE, after=cursor, oldest_first=True):
+                fetched_any = True
+                cursor = discord.Object(id=msg.id)
+                yield msg
+            attempt = 0
+            if not fetched_any:
+                return
+            await asyncio.sleep(BACKFILL_PAGE_DELAY)
+        except discord.RateLimited as exc:
+            console.warning("Backfill: rate limited in #%s, sleeping %.1fs", channel.name, exc.retry_after)
+            await asyncio.sleep(exc.retry_after)
+        except discord.HTTPException as exc:
+            if not _backfill_should_retry(exc):
+                raise
+            delay = _backfill_retry_delay(attempt)
+            attempt += 1
+            console.warning(
+                "Backfill: HTTP %s in #%s, retrying in %.1fs",
+                getattr(exc, "status", "?"), channel.name, delay,
+            )
+            await asyncio.sleep(delay)
+
+
 # ── Client ────────────────────────────────────────────────────────────────────
 
 class MessageLogger(discord.Client):
@@ -1669,7 +1773,8 @@ class MessageLogger(discord.Client):
 
     async def _cache_message(self, message: discord.Message,
                               attachments: list[dict] | None = None,
-                              stickers: list[dict] | None = None) -> None:
+                              stickers: list[dict] | None = None,
+                              commit: bool = True) -> None:
         att_json = json.dumps(attachments if attachments is not None else [
             {"filename": a.filename, "url": a.url} for a in message.attachments
         ])
@@ -1693,7 +1798,8 @@ class MessageLogger(discord.Client):
                 str(message.author.display_avatar.url),
             ),
         )
-        await self._db.commit()
+        if commit:
+            await self._db.commit()
 
     async def _pop_cached(self, message_id: int) -> CachedMessage | None:
         async with self._db.execute(
@@ -1792,6 +1898,135 @@ class MessageLogger(discord.Client):
             except Exception as exc:
                 console.warning("Missed delete check failed for #%s: %s", channel.name, exc)
             await asyncio.sleep(0.5)
+
+    async def _save_backfill_progress(
+        self, guild_id: int, channel_id: int, channel_name: str,
+        last_id: int | None, done: bool, cached_count: int,
+    ) -> None:
+        await self._db.execute(
+            """INSERT INTO backfill_progress
+                   (guild_id, channel_id, channel_name, last_id, done, cached_count, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+                   channel_name = excluded.channel_name,
+                   last_id = excluded.last_id,
+                   done = excluded.done,
+                   cached_count = excluded.cached_count,
+                   updated_at = excluded.updated_at""",
+            (guild_id, channel_id, channel_name, last_id, int(done), cached_count,
+             datetime.now(timezone.utc).isoformat()),
+        )
+        await self._db.commit()
+
+    async def _backfill_channel(
+        self, guild: discord.Guild, channel: discord.TextChannel,
+        after_id: int | None, cached_count: int, state: dict,
+    ) -> int:
+        """Cache one channel's full history into `messages`, oldest-first,
+        resumable from `after_id`. Commits (messages + progress checkpoint)
+        every BACKFILL_PAGE_SIZE messages so a restart mid-channel resumes
+        close to where it left off, not from the channel's beginning. Marks
+        done=1 only once history is fully exhausted. Never touches
+        mirror_queue/mirror_notifications and never downloads attachments —
+        only the same lightweight filename/url JSON _cache_message already
+        stores for live messages. Updates `state` after each checkpoint so
+        the progress ticker always has a fresh number to report, even mid-channel.
+        """
+        batch = 0
+        last_id = after_id
+        state["current_cached"] = cached_count
+        async for msg in _iter_channel_history_resumable(channel, after_id):
+            await self._cache_message(msg, commit=False)
+            last_id = msg.id
+            cached_count += 1
+            batch += 1
+            if batch >= BACKFILL_PAGE_SIZE:
+                await self._db.commit()
+                await self._save_backfill_progress(
+                    guild.id, channel.id, channel.name, last_id, done=False, cached_count=cached_count
+                )
+                state["current_cached"] = cached_count
+                state["total_cached"] += batch
+                batch = 0
+        if batch:
+            await self._db.commit()
+            state["current_cached"] = cached_count
+            state["total_cached"] += batch
+        await self._save_backfill_progress(
+            guild.id, channel.id, channel.name, last_id, done=True, cached_count=cached_count
+        )
+        return cached_count
+
+    async def _run_guild_backfill(
+        self, guild: discord.Guild, fallback_channel: "discord.abc.Messageable | None" = None,
+    ) -> None:
+        """Background job for `!backfill`: walks every text channel in `guild`,
+        one channel at a time, skipping channels already marked done. Removes
+        `guild.id` from `_active_backfills` on exit (success or failure) so
+        the guild is never permanently stuck as 'running'. Runs a periodic
+        progress ticker alongside the walk and posts a final summary —
+        both go to the log channel if one is configured, otherwise to
+        `fallback_channel` (the channel `!backfill` was typed in).
+        """
+        console.info("Backfill: starting for %s (%s)", guild.name, guild.id)
+        started = datetime.now(timezone.utc)
+        channels = list(guild.text_channels)
+        channels_done = 0
+        channels_skipped = 0
+        state = {
+            "channels_done": 0,
+            "total_channels": len(channels),
+            "current_channel": "",
+            "current_cached": 0,
+            "total_cached": 0,
+        }
+        stop_event = asyncio.Event()
+        ticker = asyncio.create_task(
+            _backfill_progress_ticker(guild, state, fallback_channel, stop_event),
+            name=f"backfill-ticker-{guild.id}",
+        )
+        try:
+            for channel in channels:
+                async with self._db.execute(
+                    "SELECT last_id, done, cached_count FROM backfill_progress WHERE guild_id = ? AND channel_id = ?",
+                    (guild.id, channel.id),
+                ) as cur:
+                    row = await cur.fetchone()
+                if row and row[1]:
+                    channels_skipped += 1
+                    state["channels_done"] = channels_done + channels_skipped
+                    continue
+                after_id = row[0] if row else None
+                cached_so_far = row[2] if row else 0
+                state["current_channel"] = channel.name
+                console.info("Backfill: #%s starting (resume after=%s)", channel.name, after_id)
+                try:
+                    cached_total = await self._backfill_channel(guild, channel, after_id, cached_so_far, state)
+                    channels_done += 1
+                    console.info("Backfill: #%s finished (%d cached total)", channel.name, cached_total)
+                except discord.Forbidden:
+                    console.warning("Backfill: no access to #%s, skipping", channel.name)
+                except Exception as exc:
+                    console.error("Backfill: #%s failed: %r", channel.name, exc, exc_info=exc)
+                state["channels_done"] = channels_done + channels_skipped
+                await asyncio.sleep(BACKFILL_CHANNEL_DELAY)
+        finally:
+            stop_event.set()
+            ticker.cancel()
+            try:
+                await ticker
+            except asyncio.CancelledError:
+                pass
+            _active_backfills.discard(guild.id)
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        await _post_backfill_update(
+            f"✅ Backfill complete for **{guild.name}**\n"
+            f"Channels backfilled: {channels_done} (already done: {channels_skipped})\n"
+            f"Messages cached this run: {state['total_cached']:,}\n"
+            f"Elapsed: {_fmt_duration(elapsed)}",
+            fallback_channel,
+        )
+        console.info("Backfill: complete for %s in %s", guild.name, _fmt_duration(elapsed))
 
     # ── Events ────────────────────────────────────────────────────────────────
 
@@ -1894,6 +2129,69 @@ class MessageLogger(discord.Client):
             asyncio.create_task(_refresh_and_sync(self._db), name="order-sync-cmd")
             if self._log_channel is not None:
                 await self._log_to_channel("🔄 Channel order sync started")
+            return
+
+        if message.content.strip() == "!backfill":
+            if message.guild is None:
+                return
+            if _guild_owner.get(message.guild.id) != id(self):
+                return
+            src_guild_id = _server_mirror_dst_to_src.get(message.guild.id)
+            if src_guild_id is None:
+                await _cmd_reply(message, "This isn't a configured mirror-destination guild.")
+                return
+            src_client = _guild_client.get(src_guild_id)
+            src_guild = src_client.get_guild(src_guild_id) if src_client else None
+            if src_client is None or src_guild is None:
+                await _cmd_reply(message, "Source guild isn't currently accessible.")
+                return
+            if src_guild_id in _active_backfills:
+                await _cmd_reply(message, "⏳ A backfill is already running for this mirror's source guild.")
+                return
+            _active_backfills.add(src_guild_id)
+            asyncio.create_task(
+                src_client._run_guild_backfill(src_guild, fallback_channel=message.channel),
+                name=f"backfill-{src_guild_id}",
+            )
+            await _post_backfill_update(
+                f"📼 Backfill started for source guild **{src_guild.name}** — caching full history "
+                f"into the delete-recovery cache (no mirroring, no downloads). "
+                f"Progress updates will post every {int(BACKFILL_PROGRESS_INTERVAL // 60)} min, "
+                f"with a summary when it's done.",
+                message.channel,
+            )
+            return
+
+        if message.content.strip() == "!backfill-status":
+            if message.guild is None:
+                return
+            src_guild_id = _server_mirror_dst_to_src.get(message.guild.id)
+            if src_guild_id is None:
+                await _cmd_reply(message, "This isn't a configured mirror-destination guild.")
+                return
+            async with self._db.execute(
+                "SELECT channel_name, last_id, done, cached_count FROM backfill_progress "
+                "WHERE guild_id = ? ORDER BY channel_name",
+                (src_guild_id,),
+            ) as cur:
+                rows = await cur.fetchall()
+            running = src_guild_id in _active_backfills
+            if not rows:
+                suffix = " (currently running)" if running else " — run `!backfill` to start"
+                await _cmd_reply(message, f"No backfill data for this mirror's source guild yet.{suffix}")
+                return
+            done_count = sum(1 for r in rows if r[2])
+            total_cached = sum(r[3] for r in rows)
+            lines = [
+                f"📼 **Backfill status**" + (" — running" if running else " — idle"),
+                f"{done_count}/{len(rows)} channels complete · {total_cached:,} messages cached",
+            ]
+            for name, last_id, done, cached_count in rows:
+                if done:
+                    continue
+                status = f"in progress (resume after {last_id}, {cached_count:,} cached)" if last_id else "not started"
+                lines.append(f"  #{name} — {status}")
+            await _cmd_reply(message, "\n".join(lines))
             return
 
         if message.content.strip().startswith("!vc-stats"):
@@ -2188,6 +2486,8 @@ class MessageLogger(discord.Client):
                 "`!stats` — server-wide summary",
                 "`!sync` — full mirror re-sync (archive, names, order)",
                 "`!sync-order` — re-sync mirror channel ordering",
+                "`!backfill` — cache the mirrored source guild's full message history into the delete-recovery cache (DB only, no mirroring, no downloads); run from the destination guild",
+                "`!backfill-status` — check backfill progress for this mirror's source guild; run from the destination guild",
             ]
             await _cmd_reply(message,"\n".join(lines))
             return
@@ -3066,6 +3366,18 @@ async def main() -> None:
             dst_guild_id INTEGER NOT NULL,
             order_json   TEXT    NOT NULL,
             PRIMARY KEY (src_guild_id, dst_guild_id)
+        )
+    """)
+    await db.execute("""
+        CREATE TABLE IF NOT EXISTS backfill_progress (
+            guild_id     INTEGER NOT NULL,
+            channel_id   INTEGER NOT NULL,
+            channel_name TEXT,
+            last_id      INTEGER,
+            done         INTEGER NOT NULL DEFAULT 0,
+            cached_count INTEGER NOT NULL DEFAULT 0,
+            updated_at   TEXT,
+            PRIMARY KEY (guild_id, channel_id)
         )
     """)
     # Migrations for existing DBs

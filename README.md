@@ -21,6 +21,7 @@ Mirroring is opt-in and configured separately from logging. Set `MIRROR_CHANNELS
 - **Thread mirroring** — threads created in mirrored text channels are automatically created in the destination and kept in sync
 - **Channel renames** — renaming a channel, voice channel, or forum in the source updates the destination channel's name in real time
 - **Channel ordering** — destination guild channel and category order is kept in sync with the source; the correct order is cached in the DB and restored automatically if it drifts
+- **Historical backfill** — on-demand `!backfill` command caches a mirror source guild's full message history into the delete-recovery cache; DB only, nothing is relayed or downloaded (`MIRROR_SERVERS`)
 
 ### Voice & member stats
 - **Voice session tracking** — every VC join and leave is recorded with timestamps and duration in `data/cache.db`
@@ -39,6 +40,8 @@ Mirroring is opt-in and configured separately from logging. Set `MIRROR_CHANNELS
 | `!stats` | Server-wide summary: messages, VC hours, profiles cached |
 | `!sync` | Full mirror re-sync: archive state, channel names, then ordering |
 | `!sync-order` | Re-sync mirror channel ordering |
+| `!backfill` | Cache a mirror source guild's full message history into the delete-recovery cache; run from the destination guild |
+| `!backfill-status` | Check backfill progress for a mirror's source guild; run from the destination guild |
 | `!help` | Lists all commands |
 
 ### General
@@ -127,3 +130,13 @@ The correct order is derived from the source guild and cached in `data/cache.db`
 Send `!sync-order` as the main account to trigger this immediately on demand.
 
 `🔒 Unreadable` and `📁 Archived` categories are always kept at the bottom regardless of source ordering.
+
+### Historical backfill
+
+Messages older than when the bot started logging aren't in `data/cache.db`, so if one of them is later deleted, the log shows `Content: <unknown>` instead of the original text. `!backfill` fixes this retroactively for a mirrored guild.
+
+Send `!backfill` as any account **in the destination guild** (the bot resolves which source guild to backfill via `MIRROR_SERVERS`). The bot then walks that source guild's full text-channel history, oldest message first, and caches it into `data/cache.db` — it does not relay anything to the destination guild and does not download attachments, it only stores enough metadata to recover a message's content if it's ever deleted.
+
+This is deliberately slow: small pages, multi-second delays between pages and between channels, one channel at a time. A guild with a lot of history can take a long time to fully backfill — that's intentional, to keep the request pattern conservative on a self-bot account. Progress posts to the log channel (or to the channel the command was run in, if no `LOG_CHANNEL_ID` is set) every 5 minutes, plus a summary when the whole guild is done. Use `!backfill-status` to check progress on demand.
+
+It's safe to run once and forget — channels that finish are skipped on any future run, and if the bot restarts mid-backfill it resumes from its last checkpoint instead of starting over. Only one backfill runs at a time per source guild.
