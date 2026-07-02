@@ -2134,7 +2134,12 @@ class MessageLogger(discord.Client):
         if message.content.strip() == "!backfill":
             if message.guild is None:
                 return
-            if _guild_owner.get(message.guild.id) != id(self):
+            # _guild_owner is only ever set by non-poster (DISCORD_TOKENS) clients, so
+            # a destination guild that's only reachable via LOG_POSTER_TOKEN would never
+            # have an owner and this command would silently no-op for every client.
+            # _guild_client is populated by poster-only clients too, so use that instead
+            # to still guarantee exactly one client instance handles the command.
+            if _guild_client.get(message.guild.id) is not self:
                 return
             src_guild_id = _server_mirror_dst_to_src.get(message.guild.id)
             if src_guild_id is None:
