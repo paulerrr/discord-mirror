@@ -1655,6 +1655,9 @@ BACKFILL_RETRY_JITTER = 0.25     # + up to 25% jitter on every backoff sleep
 BACKFILL_PROGRESS_INTERVAL = 300.0  # seconds between periodic "still running" updates
 
 _active_backfills: set[int] = set()  # source guild ids with a backfill currently running
+# Strong references to running backfill tasks — asyncio only keeps weak refs to
+# tasks, so a fire-and-forget task with no other reference can be GC'd mid-run.
+_backfill_tasks: set[asyncio.Task] = set()
 
 
 async def _post_backfill_update(text: str, fallback_channel: "discord.abc.Messageable | None") -> None:
@@ -1670,7 +1673,10 @@ async def _post_backfill_update(text: str, fallback_channel: "discord.abc.Messag
         return
     if fallback_channel is not None:
         try:
-            await fallback_channel.send(text)
+            # A send on a wedged connection can hang indefinitely (no timeout in
+            # the HTTP layer) and freeze the progress ticker with it — bound it
+            # so a bad tick costs one update, not every update after it.
+            await asyncio.wait_for(fallback_channel.send(text), timeout=30.0)
         except Exception as exc:
             console.warning("Backfill: failed to post update to fallback channel: %s", exc)
 
@@ -2159,10 +2165,12 @@ class MessageLogger(discord.Client):
                 await _cmd_reply(message, "⏳ A backfill is already running for this mirror's source guild.")
                 return
             _active_backfills.add(src_guild_id)
-            asyncio.create_task(
+            task = asyncio.create_task(
                 src_client._run_guild_backfill(src_guild, fallback_channel=message.channel),
                 name=f"backfill-{src_guild_id}",
             )
+            _backfill_tasks.add(task)
+            task.add_done_callback(_backfill_tasks.discard)
             await _post_backfill_update(
                 f"📼 Backfill started for source guild **{src_guild.name}** — caching full history "
                 f"into the delete-recovery cache (no mirroring, no downloads). "
@@ -2180,7 +2188,7 @@ class MessageLogger(discord.Client):
                 await _cmd_reply(message, "This isn't a configured mirror-destination guild.")
                 return
             async with self._db.execute(
-                "SELECT channel_name, last_id, done, cached_count FROM backfill_progress "
+                "SELECT channel_name, last_id, done, cached_count, updated_at FROM backfill_progress "
                 "WHERE guild_id = ? ORDER BY channel_name",
                 (src_guild_id,),
             ) as cur:
@@ -2192,15 +2200,53 @@ class MessageLogger(discord.Client):
                 return
             done_count = sum(1 for r in rows if r[2])
             total_cached = sum(r[3] for r in rows)
+            in_progress = [r for r in rows if not r[2]]
+            # The progress table only has rows for channels the walker has
+            # already touched, so the real denominator has to come from the live
+            # source guild — inaccessible channels never get a row at all.
+            src_client = _guild_client.get(src_guild_id)
+            src_guild = src_client.get_guild(src_guild_id) if src_client else None
+            parts = [f"{done_count} done"]
+            if in_progress:
+                parts.append(f"{len(in_progress)} in progress")
+            remaining = None
+            if src_guild is not None:
+                total = len(src_guild.text_channels)
+                remaining = max(0, total - len(rows))
+                if remaining:
+                    parts.append(f"{remaining} not started")
+                channels_line = (
+                    f"Channels: {' · '.join(parts)} — source has {total} text channels "
+                    f"(inaccessible ones are skipped)"
+                )
+            else:
+                channels_line = (
+                    f"Channels attempted so far: {' · '.join(parts)} "
+                    f"(source guild offline, total unknown)"
+                )
+            if running:
+                headline = "running"
+            elif in_progress or (remaining is not None and remaining > 0):
+                headline = "stopped — `!backfill` resumes where it left off"
+            elif remaining == 0:
+                headline = "finished"
+            else:
+                headline = "not running"
             lines = [
-                f"📼 **Backfill status**" + (" — running" if running else " — idle"),
-                f"{done_count}/{len(rows)} channels complete · {total_cached:,} messages cached",
+                f"📼 **Backfill status** — {headline}",
+                channels_line,
+                f"Messages cached: {total_cached:,}",
             ]
-            for name, last_id, done, cached_count in rows:
-                if done:
+            now = datetime.now(timezone.utc)
+            for name, last_id, done, cached_count, updated_at in in_progress:
+                if last_id is None:
+                    lines.append(f"  #{name} — started but nothing cached yet")
                     continue
-                status = f"in progress (resume after {last_id}, {cached_count:,} cached)" if last_id else "not started"
-                lines.append(f"  #{name} — {status}")
+                age = ""
+                if updated_at:
+                    seconds = (now - datetime.fromisoformat(updated_at)).total_seconds()
+                    age = f", last checkpoint {_fmt_duration(seconds)} ago"
+                lines.append(f"  #{name} — {cached_count:,} messages cached{age}")
             await _cmd_reply(message, "\n".join(lines))
             return
 
