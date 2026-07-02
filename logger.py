@@ -1660,7 +1660,12 @@ _active_backfills: set[int] = set()  # source guild ids with a backfill currentl
 async def _post_backfill_update(text: str, fallback_channel: "discord.abc.Messageable | None") -> None:
     """Post a backfill status update to the log channel if one is configured,
     otherwise fall back to the channel the command was run in."""
-    if _log_poster is not None:
+    # _log_poster is set as soon as LOG_POSTER_BOT_TOKEN/LOG_POSTER_TOKEN is
+    # configured, regardless of whether LOG_CHANNEL_ID itself is set — so it's
+    # not sufficient on its own to mean "there's a working log channel".
+    # BotPoster._send_chunked silently no-ops without a channel id, which is
+    # why this needs the LOG_CHANNEL_ID check too, not just _log_poster.
+    if LOG_CHANNEL_ID and _log_poster is not None:
         await _post_queue.put((text, []))
         return
     if fallback_channel is not None:
