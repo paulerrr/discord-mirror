@@ -2819,6 +2819,23 @@ class MessageLogger(discord.Client):
             notif = f"🗑️ **{discord.utils.escape_markdown(cached.author)}** deleted their message"
             if jump_row:
                 notif += f" — [jump to mirror]({jump_row[0]})"
+            else:
+                # No mirror copy exists (e.g. the message was only backfilled),
+                # so the recovered content has to travel in the notification itself.
+                extra_lines = []
+                if cached.attachments:
+                    extra_lines.append(
+                        "Attachments: " + "  ".join(a["filename"] for a in cached.attachments)
+                    )
+                if cached.stickers:
+                    extra_lines.append(
+                        "Stickers: " + "  ".join(s["name"] for s in cached.stickers)
+                    )
+                content = discord.utils.escape_markdown(cached.content) if cached.content else "<no text>"
+                budget = max(0, 2000 - len(notif) - sum(len(l) + 1 for l in extra_lines) - len("\nContent: …"))
+                if len(content) > budget:
+                    content = content[:budget] + "…"
+                notif = "\n".join([notif, f"Content: {content}", *extra_lines])[:2000]
             await self._db.execute(
                 "INSERT INTO mirror_notifications (webhook_url, content) VALUES (?, ?)",
                 (wurl, notif),

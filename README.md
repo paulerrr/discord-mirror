@@ -137,6 +137,8 @@ Messages older than when the bot started logging aren't in `data/cache.db`, so i
 
 Send `!backfill` as any account **in the destination guild** (the bot resolves which source guild to backfill via `MIRROR_SERVERS`). The bot then walks that source guild's full text-channel history, oldest message first, and caches it into `data/cache.db` — it does not relay anything to the destination guild and does not download attachments, it only stores enough metadata to recover a message's content if it's ever deleted.
 
+When a cached message that was never relayed (i.e. a backfilled one) is later deleted, the delete notification posted to the mirror includes the recovered content, attachment filenames, and sticker names — since there's no mirror copy to jump to. Deletes of live-mirrored messages keep the compact "jump to mirror" link instead.
+
 This is deliberately slow: small pages, multi-second delays between pages and between channels, one channel at a time. A guild with a lot of history can take a long time to fully backfill — that's intentional, to keep the request pattern conservative on a self-bot account. Progress posts to the log channel (or to the channel the command was run in, if no `LOG_CHANNEL_ID` is set) every 5 minutes, plus a summary when the whole guild is done.
 
 Use `!backfill-status` to check progress on demand. It reports channel counts against the source guild's actual text-channel total (done / in progress / not started), the total messages cached, and — for the channel currently being walked — how long ago its last checkpoint was written, so you can tell at a glance whether the walker is still advancing even if progress posts have gone quiet.
