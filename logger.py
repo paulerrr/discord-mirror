@@ -238,7 +238,15 @@ async def _post_worker() -> None:
                     poster = await _resolve_poster(channel_id)
                     if poster is None:
                         raise RuntimeError(f"no account can post to log channel {channel_id}")
-                    await poster._send_chunked(channel_id, text, files)
+                    # A send on a wedged connection can hang forever (no timeout
+                    # in the self-bot HTTP layer) — and this worker is the single
+                    # consumer for every log-channel post, so an unbounded hang
+                    # here silently stalls the whole queue. Bound it so a bad
+                    # send costs one retry, not every post after it.
+                    await asyncio.wait_for(
+                        poster._send_chunked(channel_id, text, files),
+                        timeout=120.0 if files else 30.0,
+                    )
                     break
                 except Exception as exc:
                     _channel_poster.pop(channel_id, None)
@@ -252,15 +260,36 @@ async def _post_worker() -> None:
             _post_queue.task_done()
 
 
+# Most filesystems cap a single filename at 255 bytes; stay well under so
+# Discord attachment names of any length can't abort a save (OSError 36).
+_MAX_FILENAME_BYTES = 200
+
+
+def _media_dest_name(message_id: int, filename: str) -> str:
+    """`{message_id}_{filename}`, with the stem truncated on a UTF-8 boundary
+    when the result would exceed filesystem filename limits. Deterministic, so
+    the pre-download exists() dedupe keeps working across resumed backfills."""
+    name = f"{message_id}_{filename}"
+    if len(name.encode()) <= _MAX_FILENAME_BYTES:
+        return name
+    stem, dot, ext = filename.rpartition(".")
+    if not dot or len(ext.encode()) > 20:  # no usable extension
+        stem, ext = filename, ""
+    prefix = f"{message_id}_"
+    budget = _MAX_FILENAME_BYTES - len(prefix.encode()) - (len(ext.encode()) + 1 if ext else 0)
+    stem = stem.encode()[:budget].decode(errors="ignore")
+    return f"{prefix}{stem}.{ext}" if ext else f"{prefix}{stem}"
+
+
 async def _save_attachment(session: aiohttp.ClientSession,
                             message: discord.Message,
                             attachment: discord.Attachment) -> str | None:
     guild_dir = MEDIA_DIR / (str(message.guild.id) if message.guild else "DMs")
     guild_dir.mkdir(parents=True, exist_ok=True)
-    dest = guild_dir / f"{message.id}_{attachment.filename}"
-    if dest.exists():
-        return str(dest.relative_to(MEDIA_DIR))
+    dest = guild_dir / _media_dest_name(message.id, attachment.filename)
     try:
+        if dest.exists():
+            return str(dest.relative_to(MEDIA_DIR))
         async with _download_sem:
             async with session.get(attachment.url) as resp:
                 if resp.status == 200:
@@ -280,9 +309,9 @@ async def _save_sticker(session: aiohttp.ClientSession,
     guild_dir.mkdir(parents=True, exist_ok=True)
     ext = "gif" if sticker.format == discord.StickerFormatType.gif else "png"
     dest = guild_dir / f"{sticker.id}.{ext}"
-    if dest.exists():
-        return str(dest.relative_to(MEDIA_DIR))
     try:
+        if dest.exists():
+            return str(dest.relative_to(MEDIA_DIR))
         async with _download_sem:
             async with session.get(sticker.url) as resp:
                 if resp.status == 200:
@@ -1802,14 +1831,19 @@ async def _backfill_progress_ticker(
             pass
         verb = "processed" if state.get("download_media") else "cached"
         title = "Backfill (with attachments)" if state.get("download_media") else "Backfill"
-        await _post_backfill_update(
-            guild.id,
-            f"📼 {title} in progress for **{guild.name}**\n"
-            f"Channel {state['channels_done']}/{state['total_channels']} "
-            f"(current: #{state['current_channel']}, {state['current_cached']:,} {verb} in it so far)\n"
-            f"Total messages {verb} this run: {state['total_cached']:,}",
-            fallback_channel,
-        )
+        try:
+            await _post_backfill_update(
+                guild.id,
+                f"📼 {title} in progress for **{guild.name}**\n"
+                f"Channel {state['channels_done']}/{state['total_channels']} "
+                f"(current: #{state['current_channel']}, {state['current_cached']:,} {verb} in it so far)\n"
+                f"Total messages {verb} this run: {state['total_cached']:,}",
+                fallback_channel,
+            )
+        except Exception as exc:
+            # A failed update must never kill the ticker — the backfill keeps
+            # running for hours and this loop is the only sign of life.
+            console.warning("Backfill: progress update failed: %s", exc)
 
 
 def _backfill_should_retry(exc: discord.HTTPException) -> bool:
