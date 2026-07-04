@@ -1720,10 +1720,10 @@ def _backfill_retry_delay(attempt: int) -> float:
 
 
 async def _iter_channel_history_resumable(
-    channel: discord.TextChannel,
+    channel: discord.TextChannel | discord.VoiceChannel,
     after_id: int | None,
 ) -> AsyncIterator[discord.Message]:
-    """Yield a text channel's full history oldest-first, resuming from `after_id`
+    """Yield a channel's full history oldest-first, resuming from `after_id`
     when given. Paces requests conservatively between pages and retries
     retryable HTTP errors indefinitely with capped exponential backoff plus
     jitter — a backfill job is expected to eventually finish, not give up.
@@ -2005,7 +2005,7 @@ class MessageLogger(discord.Client):
         await self._db.commit()
 
     async def _backfill_channel(
-        self, guild: discord.Guild, channel: discord.TextChannel,
+        self, guild: discord.Guild, channel: discord.TextChannel | discord.VoiceChannel,
         after_id: int | None, cached_count: int, state: dict,
         download_media: bool = False,
     ) -> int:
@@ -2125,7 +2125,8 @@ class MessageLogger(discord.Client):
         download_media: bool = False,
     ) -> None:
         """Background job for `!backfill` / `!backfill-with-attachments`: walks
-        every text channel in `guild`, one channel at a time, skipping channels
+        every text channel and voice-channel text chat in `guild`, one channel
+        at a time, skipping channels
         whose relevant pass is already done. The content pass (`download_media`
         False) and the attachment pass (True) track progress on independent
         columns, so the attachment pass can run — and resume — after a
@@ -2141,7 +2142,7 @@ class MessageLogger(discord.Client):
             " with attachments" if download_media else "",
         )
         started = datetime.now(timezone.utc)
-        channels = list(guild.text_channels)
+        channels = list(guild.text_channels) + list(guild.voice_channels)
         channels_done = 0
         channels_skipped = 0
         state = {
@@ -2361,12 +2362,12 @@ class MessageLogger(discord.Client):
                 parts.append(f"{len(in_progress)} in progress")
             remaining = None
             if src_guild is not None:
-                total = len(src_guild.text_channels)
+                total = len(src_guild.text_channels) + len(src_guild.voice_channels)
                 remaining = max(0, total - len(rows))
                 if remaining:
                     parts.append(f"{remaining} not started")
                 channels_line = (
-                    f"Channels: {' · '.join(parts)} — source has {total} text channels "
+                    f"Channels: {' · '.join(parts)} — source has {total} text/voice channels "
                     f"(inaccessible ones are skipped)"
                 )
             else:
