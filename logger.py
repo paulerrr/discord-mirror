@@ -1639,12 +1639,15 @@ async def _voice_summary_worker(db: aiosqlite.Connection) -> None:
         console.info("Voice summary posted for %s (%d users)", yesterday, len(rows))
 
 
-# ── Backfill (historical cache-only ingestion) ──────────────────────────────
+# ── Backfill (historical cache ingestion) ───────────────────────────────────
 # Walks a mirror-source guild's full text-channel history and inserts rows
-# into `messages` only (see MessageLogger._run_guild_backfill /
-# _backfill_channel below). Paced very conservatively since this runs on a
-# self-bot account and sustained scraping-shaped request patterns are exactly
-# what risks automated-behavior detection.
+# into `messages` (see MessageLogger._run_guild_backfill / _backfill_channel
+# below). `!backfill` caches metadata only; `!backfill-with-attachments` also
+# downloads attachments and stickers to media/. The two run as independent
+# passes with separate resume cursors, so attachments can be fetched after a
+# metadata-only backfill has already completed. Paced very conservatively since
+# this runs on a self-bot account and sustained scraping-shaped request
+# patterns are exactly what risks automated-behavior detection.
 
 BACKFILL_PAGE_SIZE = 50          # messages per history() page (Discord max is 100)
 BACKFILL_PAGE_DELAY = 3.0        # seconds between pages within a channel
@@ -1696,11 +1699,13 @@ async def _backfill_progress_ticker(
             return  # stop_event was set
         except asyncio.TimeoutError:
             pass
+        verb = "processed" if state.get("download_media") else "cached"
+        title = "Backfill (with attachments)" if state.get("download_media") else "Backfill"
         await _post_backfill_update(
-            f"📼 Backfill in progress for **{guild.name}**\n"
+            f"📼 {title} in progress for **{guild.name}**\n"
             f"Channel {state['channels_done']}/{state['total_channels']} "
-            f"(current: #{state['current_channel']}, {state['current_cached']:,} cached in it so far)\n"
-            f"Total messages cached this run: {state['total_cached']:,}",
+            f"(current: #{state['current_channel']}, {state['current_cached']:,} {verb} in it so far)\n"
+            f"Total messages {verb} this run: {state['total_cached']:,}",
             fallback_channel,
         )
 
@@ -1812,6 +1817,32 @@ class MessageLogger(discord.Client):
         if commit:
             await self._db.commit()
 
+    async def _save_message_media(
+        self, message: discord.Message,
+    ) -> tuple[list[dict], list[dict]]:
+        """Download a message's attachments and stickers to media/ and return the
+        (attachments, stickers) record lists for _cache_message. Each record is the
+        lightweight {filename, url[, local_path]} / {id, name, format[, local_path]}
+        dict; local_path is only present when the download succeeded. Shared by the
+        live logging path and attachment-enabled backfill so both save media the same way.
+        """
+        att_records: list[dict] = []
+        for att in message.attachments:
+            local = await _save_attachment(self._session, message, att)
+            rec: dict = {"filename": att.filename, "url": att.url}
+            if local:
+                rec["local_path"] = local
+            att_records.append(rec)
+
+        stk_records: list[dict] = []
+        for s in message.stickers:
+            local = await _save_sticker(self._session, message, s)
+            rec = {"id": s.id, "name": s.name, "format": s.format.name}
+            if local:
+                rec["local_path"] = local
+            stk_records.append(rec)
+        return att_records, stk_records
+
     async def _pop_cached(self, message_id: int) -> CachedMessage | None:
         async with self._db.execute(
             "SELECT id, author, author_id, channel, guild_name, content, created_at, attachments, stickers "
@@ -1913,48 +1944,104 @@ class MessageLogger(discord.Client):
     async def _save_backfill_progress(
         self, guild_id: int, channel_id: int, channel_name: str,
         last_id: int | None, done: bool, cached_count: int,
+        download_media: bool = False,
     ) -> None:
-        await self._db.execute(
-            """INSERT INTO backfill_progress
-                   (guild_id, channel_id, channel_name, last_id, done, cached_count, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(guild_id, channel_id) DO UPDATE SET
-                   channel_name = excluded.channel_name,
-                   last_id = excluded.last_id,
-                   done = excluded.done,
-                   cached_count = excluded.cached_count,
-                   updated_at = excluded.updated_at""",
-            (guild_id, channel_id, channel_name, last_id, int(done), cached_count,
-             datetime.now(timezone.utc).isoformat()),
-        )
+        now = datetime.now(timezone.utc).isoformat()
+        if download_media and done:
+            # Channel fully walked with downloads. The attachment pass caches the
+            # same metadata the content pass does, so a completed attachment pass
+            # is a superset — mark BOTH axes done. Writing cached_count here is
+            # safe precisely because the channel is complete: a finished media
+            # walk has cached every message (== the content pass's total). The
+            # media-only branch below (intermediate checkpoints) never touches the
+            # content columns, so an interrupted attachment pass can't corrupt an
+            # existing content cached_count.
+            await self._db.execute(
+                """INSERT INTO backfill_progress
+                       (guild_id, channel_id, channel_name, last_id, done, cached_count, updated_at,
+                        media_last_id, media_done)
+                   VALUES (?, ?, ?, ?, 1, ?, ?, ?, 1)
+                   ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+                       channel_name = excluded.channel_name,
+                       last_id = excluded.last_id,
+                       done = excluded.done,
+                       cached_count = excluded.cached_count,
+                       updated_at = excluded.updated_at,
+                       media_last_id = excluded.media_last_id,
+                       media_done = excluded.media_done""",
+                (guild_id, channel_id, channel_name, last_id, cached_count, now, last_id),
+            )
+        elif download_media:
+            # Intermediate attachment-pass checkpoint. Tracks only the media
+            # resume cursor so it stays independent of the content pass — a
+            # channel already content-done can still have attachments fetched
+            # later without its content state being disturbed mid-walk.
+            # cached_count only seeds a freshly inserted row; on an existing row
+            # it never clobbers the content pass's tally.
+            await self._db.execute(
+                """INSERT INTO backfill_progress
+                       (guild_id, channel_id, channel_name, media_last_id, media_done, cached_count, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+                       channel_name = excluded.channel_name,
+                       media_last_id = excluded.media_last_id,
+                       media_done = excluded.media_done,
+                       updated_at = excluded.updated_at""",
+                (guild_id, channel_id, channel_name, last_id, int(done), cached_count, now),
+            )
+        else:
+            await self._db.execute(
+                """INSERT INTO backfill_progress
+                       (guild_id, channel_id, channel_name, last_id, done, cached_count, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+                       channel_name = excluded.channel_name,
+                       last_id = excluded.last_id,
+                       done = excluded.done,
+                       cached_count = excluded.cached_count,
+                       updated_at = excluded.updated_at""",
+                (guild_id, channel_id, channel_name, last_id, int(done), cached_count, now),
+            )
         await self._db.commit()
 
     async def _backfill_channel(
         self, guild: discord.Guild, channel: discord.TextChannel,
         after_id: int | None, cached_count: int, state: dict,
+        download_media: bool = False,
     ) -> int:
         """Cache one channel's full history into `messages`, oldest-first,
         resumable from `after_id`. Commits (messages + progress checkpoint)
         every BACKFILL_PAGE_SIZE messages so a restart mid-channel resumes
         close to where it left off, not from the channel's beginning. Marks
-        done=1 only once history is fully exhausted. Never touches
-        mirror_queue/mirror_notifications and never downloads attachments —
-        only the same lightweight filename/url JSON _cache_message already
-        stores for live messages. Updates `state` after each checkpoint so
-        the progress ticker always has a fresh number to report, even mid-channel.
+        the pass done only once history is fully exhausted. Never touches
+        mirror_queue/mirror_notifications.
+
+        When `download_media` is False the message metadata is stored with the
+        same lightweight filename/url JSON _cache_message keeps for live
+        messages, and nothing is downloaded. When True, each message's
+        attachments and stickers are also downloaded to media/ (fresh CDN URLs
+        straight from history) and the local paths recorded — this is the
+        attachment pass, tracked on its own resume cursor so it can run after a
+        metadata-only backfill. Updates `state` after each checkpoint so the
+        progress ticker always has a fresh number to report, even mid-channel.
         """
         batch = 0
         last_id = after_id
         state["current_cached"] = cached_count
         async for msg in _iter_channel_history_resumable(channel, after_id):
-            await self._cache_message(msg, commit=False)
+            if download_media:
+                att_records, stk_records = await self._save_message_media(msg)
+                await self._cache_message(msg, att_records, stk_records, commit=False)
+            else:
+                await self._cache_message(msg, commit=False)
             last_id = msg.id
             cached_count += 1
             batch += 1
             if batch >= BACKFILL_PAGE_SIZE:
                 await self._db.commit()
                 await self._save_backfill_progress(
-                    guild.id, channel.id, channel.name, last_id, done=False, cached_count=cached_count
+                    guild.id, channel.id, channel.name, last_id, done=False,
+                    cached_count=cached_count, download_media=download_media,
                 )
                 state["current_cached"] = cached_count
                 state["total_cached"] += batch
@@ -1964,22 +2051,86 @@ class MessageLogger(discord.Client):
             state["current_cached"] = cached_count
             state["total_cached"] += batch
         await self._save_backfill_progress(
-            guild.id, channel.id, channel.name, last_id, done=True, cached_count=cached_count
+            guild.id, channel.id, channel.name, last_id, done=True,
+            cached_count=cached_count, download_media=download_media,
         )
         return cached_count
 
+    async def _start_backfill(self, message: discord.Message, download_media: bool) -> None:
+        """Shared handler for `!backfill` and `!backfill-with-attachments`: resolves
+        the mirror source guild for the destination guild the command was run in,
+        guards against a concurrent backfill, and launches the walk. `download_media`
+        selects the metadata-only pass vs. the attachment-downloading pass.
+        """
+        if message.guild is None:
+            return
+        # _guild_owner is only ever set by non-poster (DISCORD_TOKENS) clients, so
+        # a destination guild that's only reachable via LOG_POSTER_TOKEN would never
+        # have an owner and this command would silently no-op for every client.
+        # _guild_client is populated by poster-only clients too, so use that instead
+        # to still guarantee exactly one client instance handles the command.
+        if _guild_client.get(message.guild.id) is not self:
+            return
+        src_guild_id = _server_mirror_dst_to_src.get(message.guild.id)
+        if src_guild_id is None:
+            await _cmd_reply(message, "This isn't a configured mirror-destination guild.")
+            return
+        src_client = _guild_client.get(src_guild_id)
+        src_guild = src_client.get_guild(src_guild_id) if src_client else None
+        if src_client is None or src_guild is None:
+            await _cmd_reply(message, "Source guild isn't currently accessible.")
+            return
+        if src_guild_id in _active_backfills:
+            await _cmd_reply(message, "⏳ A backfill is already running for this mirror's source guild.")
+            return
+        _active_backfills.add(src_guild_id)
+        task = asyncio.create_task(
+            src_client._run_guild_backfill(
+                src_guild, fallback_channel=message.channel, download_media=download_media,
+            ),
+            name=f"backfill-{src_guild_id}",
+        )
+        _backfill_tasks.add(task)
+        task.add_done_callback(_backfill_tasks.discard)
+        if download_media:
+            note = (
+                f"📼 Backfill (with attachments) started for source guild **{src_guild.name}** — "
+                f"caching full history into the delete-recovery cache and downloading attachments "
+                f"and stickers to media/ (no mirroring). Runs independently of a plain `!backfill`, "
+                f"so it also serves to fetch attachments for an already-cached guild. "
+            )
+        else:
+            note = (
+                f"📼 Backfill started for source guild **{src_guild.name}** — caching full history "
+                f"into the delete-recovery cache (no mirroring, no downloads). "
+            )
+        await _post_backfill_update(
+            note
+            + f"Progress updates will post every {int(BACKFILL_PROGRESS_INTERVAL // 60)} min, "
+            f"with a summary when it's done.",
+            message.channel,
+        )
+
     async def _run_guild_backfill(
         self, guild: discord.Guild, fallback_channel: "discord.abc.Messageable | None" = None,
+        download_media: bool = False,
     ) -> None:
-        """Background job for `!backfill`: walks every text channel in `guild`,
-        one channel at a time, skipping channels already marked done. Removes
-        `guild.id` from `_active_backfills` on exit (success or failure) so
-        the guild is never permanently stuck as 'running'. Runs a periodic
-        progress ticker alongside the walk and posts a final summary —
-        both go to the log channel if one is configured, otherwise to
-        `fallback_channel` (the channel `!backfill` was typed in).
+        """Background job for `!backfill` / `!backfill-with-attachments`: walks
+        every text channel in `guild`, one channel at a time, skipping channels
+        whose relevant pass is already done. The content pass (`download_media`
+        False) and the attachment pass (True) track progress on independent
+        columns, so the attachment pass can run — and resume — after a
+        metadata-only backfill has finished. Removes `guild.id` from
+        `_active_backfills` on exit (success or failure) so the guild is never
+        permanently stuck as 'running'. Runs a periodic progress ticker
+        alongside the walk and posts a final summary — both go to the log
+        channel if one is configured, otherwise to `fallback_channel` (the
+        channel the command was typed in).
         """
-        console.info("Backfill: starting for %s (%s)", guild.name, guild.id)
+        console.info(
+            "Backfill: starting for %s (%s)%s", guild.name, guild.id,
+            " with attachments" if download_media else "",
+        )
         started = datetime.now(timezone.utc)
         channels = list(guild.text_channels)
         channels_done = 0
@@ -1990,6 +2141,7 @@ class MessageLogger(discord.Client):
             "current_channel": "",
             "current_cached": 0,
             "total_cached": 0,
+            "download_media": download_media,
         }
         stop_event = asyncio.Event()
         ticker = asyncio.create_task(
@@ -1999,20 +2151,32 @@ class MessageLogger(discord.Client):
         try:
             for channel in channels:
                 async with self._db.execute(
-                    "SELECT last_id, done, cached_count FROM backfill_progress WHERE guild_id = ? AND channel_id = ?",
+                    "SELECT last_id, done, cached_count, media_last_id, media_done "
+                    "FROM backfill_progress WHERE guild_id = ? AND channel_id = ?",
                     (guild.id, channel.id),
                 ) as cur:
                     row = await cur.fetchone()
-                if row and row[1]:
-                    channels_skipped += 1
-                    state["channels_done"] = channels_done + channels_skipped
-                    continue
-                after_id = row[0] if row else None
-                cached_so_far = row[2] if row else 0
+                if download_media:
+                    if row and row[4]:  # media_done
+                        channels_skipped += 1
+                        state["channels_done"] = channels_done + channels_skipped
+                        continue
+                    after_id = row[3] if row else None  # media_last_id
+                    cached_so_far = 0
+                else:
+                    if row and row[1]:  # done
+                        channels_skipped += 1
+                        state["channels_done"] = channels_done + channels_skipped
+                        continue
+                    after_id = row[0] if row else None
+                    cached_so_far = row[2] if row else 0
                 state["current_channel"] = channel.name
                 console.info("Backfill: #%s starting (resume after=%s)", channel.name, after_id)
                 try:
-                    cached_total = await self._backfill_channel(guild, channel, after_id, cached_so_far, state)
+                    cached_total = await self._backfill_channel(
+                        guild, channel, after_id, cached_so_far, state,
+                        download_media=download_media,
+                    )
                     channels_done += 1
                     console.info("Backfill: #%s finished (%d cached total)", channel.name, cached_total)
                 except discord.Forbidden:
@@ -2030,10 +2194,16 @@ class MessageLogger(discord.Client):
                 pass
             _active_backfills.discard(guild.id)
         elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        label = "Backfill (with attachments)" if download_media else "Backfill"
+        processed_line = (
+            f"Messages processed this run: {state['total_cached']:,} (attachments downloaded)"
+            if download_media
+            else f"Messages cached this run: {state['total_cached']:,}"
+        )
         await _post_backfill_update(
-            f"✅ Backfill complete for **{guild.name}**\n"
+            f"✅ {label} complete for **{guild.name}**\n"
             f"Channels backfilled: {channels_done} (already done: {channels_skipped})\n"
-            f"Messages cached this run: {state['total_cached']:,}\n"
+            f"{processed_line}\n"
             f"Elapsed: {_fmt_duration(elapsed)}",
             fallback_channel,
         )
@@ -2143,41 +2313,11 @@ class MessageLogger(discord.Client):
             return
 
         if message.content.strip() == "!backfill":
-            if message.guild is None:
-                return
-            # _guild_owner is only ever set by non-poster (DISCORD_TOKENS) clients, so
-            # a destination guild that's only reachable via LOG_POSTER_TOKEN would never
-            # have an owner and this command would silently no-op for every client.
-            # _guild_client is populated by poster-only clients too, so use that instead
-            # to still guarantee exactly one client instance handles the command.
-            if _guild_client.get(message.guild.id) is not self:
-                return
-            src_guild_id = _server_mirror_dst_to_src.get(message.guild.id)
-            if src_guild_id is None:
-                await _cmd_reply(message, "This isn't a configured mirror-destination guild.")
-                return
-            src_client = _guild_client.get(src_guild_id)
-            src_guild = src_client.get_guild(src_guild_id) if src_client else None
-            if src_client is None or src_guild is None:
-                await _cmd_reply(message, "Source guild isn't currently accessible.")
-                return
-            if src_guild_id in _active_backfills:
-                await _cmd_reply(message, "⏳ A backfill is already running for this mirror's source guild.")
-                return
-            _active_backfills.add(src_guild_id)
-            task = asyncio.create_task(
-                src_client._run_guild_backfill(src_guild, fallback_channel=message.channel),
-                name=f"backfill-{src_guild_id}",
-            )
-            _backfill_tasks.add(task)
-            task.add_done_callback(_backfill_tasks.discard)
-            await _post_backfill_update(
-                f"📼 Backfill started for source guild **{src_guild.name}** — caching full history "
-                f"into the delete-recovery cache (no mirroring, no downloads). "
-                f"Progress updates will post every {int(BACKFILL_PROGRESS_INTERVAL // 60)} min, "
-                f"with a summary when it's done.",
-                message.channel,
-            )
+            await self._start_backfill(message, download_media=False)
+            return
+
+        if message.content.strip() == "!backfill-with-attachments":
+            await self._start_backfill(message, download_media=True)
             return
 
         if message.content.strip() == "!backfill-status":
@@ -2188,8 +2328,8 @@ class MessageLogger(discord.Client):
                 await _cmd_reply(message, "This isn't a configured mirror-destination guild.")
                 return
             async with self._db.execute(
-                "SELECT channel_name, last_id, done, cached_count, updated_at FROM backfill_progress "
-                "WHERE guild_id = ? ORDER BY channel_name",
+                "SELECT channel_name, last_id, done, cached_count, updated_at, media_done "
+                "FROM backfill_progress WHERE guild_id = ? ORDER BY channel_name",
                 (src_guild_id,),
             ) as cur:
                 rows = await cur.fetchall()
@@ -2200,6 +2340,7 @@ class MessageLogger(discord.Client):
                 return
             done_count = sum(1 for r in rows if r[2])
             total_cached = sum(r[3] for r in rows)
+            media_done_count = sum(1 for r in rows if r[5])
             in_progress = [r for r in rows if not r[2]]
             # The progress table only has rows for channels the walker has
             # already touched, so the real denominator has to come from the live
@@ -2232,13 +2373,19 @@ class MessageLogger(discord.Client):
                 headline = "finished"
             else:
                 headline = "not running"
+            if src_guild is not None:
+                media_line = f"Attachments: {media_done_count} of {total} channels downloaded"
+            else:
+                media_line = f"Attachments: {media_done_count} channels downloaded"
+            media_line += " — run `!backfill-with-attachments` to fetch attachments"
             lines = [
                 f"📼 **Backfill status** — {headline}",
                 channels_line,
                 f"Messages cached: {total_cached:,}",
+                media_line,
             ]
             now = datetime.now(timezone.utc)
-            for name, last_id, done, cached_count, updated_at in in_progress:
+            for name, last_id, done, cached_count, updated_at, _media_done in in_progress:
                 if last_id is None:
                     lines.append(f"  #{name} — started but nothing cached yet")
                     continue
@@ -2543,6 +2690,7 @@ class MessageLogger(discord.Client):
                 "`!sync` — full mirror re-sync (archive, names, order)",
                 "`!sync-order` — re-sync mirror channel ordering",
                 "`!backfill` — cache the mirrored source guild's full message history into the delete-recovery cache (DB only, no mirroring, no downloads); run from the destination guild",
+                "`!backfill-with-attachments` — same, but also download attachments and stickers to media/; can be run after `!backfill` to fetch attachments later; run from the destination guild",
                 "`!backfill-status` — check backfill progress for this mirror's source guild; run from the destination guild",
             ]
             await _cmd_reply(message,"\n".join(lines))
@@ -2556,21 +2704,7 @@ class MessageLogger(discord.Client):
         if message.guild:
             _write_guild_name(message.guild)
 
-        att_records: list[dict] = []
-        for att in message.attachments:
-            local = await _save_attachment(self._session, message, att)
-            rec: dict = {"filename": att.filename, "url": att.url}
-            if local:
-                rec["local_path"] = local
-            att_records.append(rec)
-
-        stk_records: list[dict] = []
-        for s in message.stickers:
-            local = await _save_sticker(self._session, message, s)
-            rec = {"id": s.id, "name": s.name, "format": s.format.name}
-            if local:
-                rec["local_path"] = local
-            stk_records.append(rec)
+        att_records, stk_records = await self._save_message_media(message)
 
         await self._cache_message(message, att_records, stk_records)
         await self._db.execute(
@@ -3446,10 +3580,12 @@ async def main() -> None:
             guild_id     INTEGER NOT NULL,
             channel_id   INTEGER NOT NULL,
             channel_name TEXT,
-            last_id      INTEGER,
-            done         INTEGER NOT NULL DEFAULT 0,
-            cached_count INTEGER NOT NULL DEFAULT 0,
-            updated_at   TEXT,
+            last_id        INTEGER,
+            done           INTEGER NOT NULL DEFAULT 0,
+            cached_count   INTEGER NOT NULL DEFAULT 0,
+            updated_at     TEXT,
+            media_last_id  INTEGER,
+            media_done     INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (guild_id, channel_id)
         )
     """)
@@ -3461,6 +3597,8 @@ async def main() -> None:
         "ALTER TABLE server_mirror_channels ADD COLUMN unreadable INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE server_mirror_forums ADD COLUMN unreadable INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE message_counts ADD COLUMN deleted_count INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE backfill_progress ADD COLUMN media_last_id INTEGER",
+        "ALTER TABLE backfill_progress ADD COLUMN media_done INTEGER NOT NULL DEFAULT 0",
     ]:
         try:
             await db.execute(migration)

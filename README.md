@@ -21,7 +21,7 @@ Mirroring is opt-in and configured separately from logging. Set `MIRROR_CHANNELS
 - **Thread mirroring** — threads created in mirrored text channels are automatically created in the destination and kept in sync
 - **Channel renames** — renaming a channel, voice channel, or forum in the source updates the destination channel's name in real time
 - **Channel ordering** — destination guild channel and category order is kept in sync with the source; the correct order is cached in the DB and restored automatically if it drifts
-- **Historical backfill** — on-demand `!backfill` command caches a mirror source guild's full message history into the delete-recovery cache; DB only, nothing is relayed or downloaded (`MIRROR_SERVERS`)
+- **Historical backfill** — on-demand `!backfill` command caches a mirror source guild's full message history into the delete-recovery cache (DB only, nothing relayed or downloaded); `!backfill-with-attachments` additionally downloads attachments and stickers to `media/`, and can be run after a plain `!backfill` to fetch attachments later (`MIRROR_SERVERS`)
 
 ### Voice & member stats
 - **Voice session tracking** — every VC join and leave is recorded with timestamps and duration in `data/cache.db`
@@ -40,7 +40,8 @@ Mirroring is opt-in and configured separately from logging. Set `MIRROR_CHANNELS
 | `!stats` | Server-wide summary: messages, VC hours, profiles cached |
 | `!sync` | Full mirror re-sync: archive state, channel names, then ordering |
 | `!sync-order` | Re-sync mirror channel ordering |
-| `!backfill` | Cache a mirror source guild's full message history into the delete-recovery cache; run from the destination guild |
+| `!backfill` | Cache a mirror source guild's full message history into the delete-recovery cache (metadata only, no downloads); run from the destination guild |
+| `!backfill-with-attachments` | Same as `!backfill` but also downloads attachments and stickers to `media/`; can be run afterwards to fetch attachments for an already-cached guild; run from the destination guild |
 | `!backfill-status` | Check backfill progress for a mirror's source guild; run from the destination guild |
 | `!help` | Lists all commands |
 
@@ -137,10 +138,12 @@ Messages older than when the bot started logging aren't in `data/cache.db`, so i
 
 Send `!backfill` as any account **in the destination guild** (the bot resolves which source guild to backfill via `MIRROR_SERVERS`). The bot then walks that source guild's full text-channel history, oldest message first, and caches it into `data/cache.db` — it does not relay anything to the destination guild and does not download attachments, it only stores enough metadata to recover a message's content if it's ever deleted.
 
-When a cached message that was never relayed (i.e. a backfilled one) is later deleted, the delete notification posted to the mirror includes the recovered content, attachment filenames, and sticker names — since there's no mirror copy to jump to. Deletes of live-mirrored messages keep the compact "jump to mirror" link instead.
+To also save the actual files, send `!backfill-with-attachments` instead. It does everything `!backfill` does and additionally downloads each message's attachments and stickers to `media/` (using the fresh CDN URLs it gets straight from history). This is a separate, independently-tracked pass, so you can run the quick metadata-only `!backfill` first and come back with `!backfill-with-attachments` later to fetch the attachments — it walks the history again and fills in the files. Only one backfill (of either kind) runs at a time per source guild.
 
-This is deliberately slow: small pages, multi-second delays between pages and between channels, one channel at a time. A guild with a lot of history can take a long time to fully backfill — that's intentional, to keep the request pattern conservative on a self-bot account. Progress posts to the log channel (or to the channel the command was run in, if no `LOG_CHANNEL_ID` is set) every 5 minutes, plus a summary when the whole guild is done.
+When a cached message that was never relayed (i.e. a backfilled one) is later deleted, the delete notification posted to the mirror includes the recovered content, attachment filenames, and sticker names — since there's no mirror copy to jump to. If the attachments were downloaded, the saved files are attached to the notification too. Deletes of live-mirrored messages keep the compact "jump to mirror" link instead.
 
-Use `!backfill-status` to check progress on demand. It reports channel counts against the source guild's actual text-channel total (done / in progress / not started), the total messages cached, and — for the channel currently being walked — how long ago its last checkpoint was written, so you can tell at a glance whether the walker is still advancing even if progress posts have gone quiet.
+This is deliberately slow: small pages, multi-second delays between pages and between channels, one channel at a time (the attachment pass adds the downloads on top, so it's slower still). A guild with a lot of history can take a long time to fully backfill — that's intentional, to keep the request pattern conservative on a self-bot account. Progress posts to the log channel (or to the channel the command was run in, if no `LOG_CHANNEL_ID` is set) every 5 minutes, plus a summary when the whole guild is done.
 
-It's safe to run once and forget — channels that finish are skipped on any future run, and if the bot restarts mid-backfill it resumes from its last checkpoint instead of starting over. Note that a restart does **not** auto-resume the walk: send `!backfill` again after the bot comes back up. Only one backfill runs at a time per source guild.
+Use `!backfill-status` to check progress on demand. It reports channel counts against the source guild's actual text-channel total (done / in progress / not started), the total messages cached, how many channels have had their attachments downloaded, and — for the channel currently being walked — how long ago its last checkpoint was written, so you can tell at a glance whether the walker is still advancing even if progress posts have gone quiet.
+
+It's safe to run once and forget — channels that finish are skipped on any future run of the same pass, and if the bot restarts mid-backfill it resumes from its last checkpoint instead of starting over. The content pass and the attachment pass track their progress independently, so finishing `!backfill` doesn't stop `!backfill-with-attachments` from later walking the same channels for files. Note that a restart does **not** auto-resume the walk: send the command again after the bot comes back up.
