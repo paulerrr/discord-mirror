@@ -138,7 +138,12 @@ Messages older than when the bot started logging aren't in `data/cache.db`, so i
 
 Send `!backfill` as any account **in the destination guild** (the bot resolves which source guild to backfill via `MIRROR_SERVERS`). The bot then walks that source guild's full text-channel history, oldest message first, and caches it into `data/cache.db` — it does not relay anything to the destination guild and does not download attachments, it only stores enough metadata to recover a message's content if it's ever deleted.
 
-To also save the actual files, send `!backfill-with-attachments` instead. It does everything `!backfill` does and additionally downloads each message's attachments and stickers to `media/` (using the fresh CDN URLs it gets straight from history). This is a separate, independently-tracked pass, so you can run the quick metadata-only `!backfill` first and come back with `!backfill-with-attachments` later to fetch the attachments — it walks the history again and fills in the files. Only one backfill (of either kind) runs at a time per source guild.
+To also save the actual files, send `!backfill-with-attachments`. It does everything `!backfill` does and additionally downloads each message's attachments and stickers to `media/` (using the fresh CDN URLs it gets straight from history). Two ways to use it:
+
+- **Fresh guild — run it alone.** It's a superset of `!backfill`: it caches the metadata *and* downloads the files in a single pass, and marks the guild fully backfilled on both counts. You don't need to run plain `!backfill` first.
+- **Already ran `!backfill` — run it afterwards to fetch attachments later.** The two are independently tracked, so a completed metadata backfill doesn't stop this pass. It walks the history again (Discord's CDN URLs are signed and expire in ~24h, so the URLs cached earlier are usually dead — re-walking gets fresh ones), re-caches the metadata harmlessly, and downloads the files.
+
+Its start message tells you which case applies — whether it's caching the full history or the history is already cached and it's mainly downloading attachments. Only one backfill (of either kind) runs at a time per source guild, and only attachments for messages still present in the source when it runs can be fetched.
 
 When a cached message that was never relayed (i.e. a backfilled one) is later deleted, the delete notification posted to the mirror includes the recovered content, attachment filenames, and sticker names — since there's no mirror copy to jump to. If the attachments were downloaded, the saved files are attached to the notification too. Deletes of live-mirrored messages keep the compact "jump to mirror" link instead.
 
