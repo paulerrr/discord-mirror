@@ -34,8 +34,44 @@ LOG_CHANNEL_ID: int | None = (
     int(os.environ["LOG_CHANNEL_ID"]) if os.environ.get("LOG_CHANNEL_ID") else None
 )
 
-LOG_POSTER_TOKEN: str | None = os.environ.get("LOG_POSTER_TOKEN", "").strip() or None
-LOG_POSTER_BOT_TOKEN: str | None = os.environ.get("LOG_POSTER_BOT_TOKEN", "").strip() or None
+# Per-guild log channel overrides: events from guild_id are posted to channel_id.
+# Guilds not listed fall back to LOG_CHANNEL_ID.
+LOG_CHANNELS: dict[int, int] = {}
+for _pair in os.environ.get("LOG_CHANNELS", "").split(","):
+    _pair = _pair.strip()
+    if not _pair:
+        continue
+    _gid, _, _cid = _pair.partition(":")
+    _gid, _cid = _gid.strip(), _cid.strip()
+    if _gid and _cid:
+        LOG_CHANNELS[int(_gid)] = int(_cid)
+
+_LOG_CHANNEL_IDS: set[int] = set(LOG_CHANNELS.values()) | (
+    {LOG_CHANNEL_ID} if LOG_CHANNEL_ID else set()
+)
+
+
+def _log_channel_for(guild_id: int | None) -> int | None:
+    """Log channel for events originating in `guild_id` (None → DMs)."""
+    if guild_id is not None and guild_id in LOG_CHANNELS:
+        return LOG_CHANNELS[guild_id]
+    return LOG_CHANNEL_ID
+
+
+def _split_tokens(*names: str) -> list[str]:
+    out: list[str] = []
+    for name in names:
+        for tok in os.environ.get(name, "").split(","):
+            tok = tok.strip()
+            if tok and tok not in out:
+                out.append(tok)
+    return out
+
+
+# Plural vars take comma-separated lists; the old singular names still work
+# and are merged in.
+LOG_POSTER_TOKENS: list[str] = _split_tokens("LOG_POSTER_TOKENS", "LOG_POSTER_TOKEN")
+LOG_POSTER_BOT_TOKENS: list[str] = _split_tokens("LOG_POSTER_BOT_TOKENS", "LOG_POSTER_BOT_TOKEN")
 
 MIRROR_MAP: dict[int, list[str]] = {}
 for _pair in os.environ.get("MIRROR_CHANNELS", "").split(","):
@@ -152,9 +188,13 @@ class CachedMessage:
 
 _guild_owner: dict[int, int] = {}
 _guild_client: dict[int, "MessageLogger"] = {}
-_log_poster: "MessageLogger | None" = None
+_all_clients: list["MessageLogger"] = []       # main (DISCORD_TOKENS) clients
+_user_posters: list["MessageLogger"] = []      # poster-only clients (LOG_POSTER_TOKENS)
+_bot_posters: list["BotPoster"] = []           # REST-only bot posters (LOG_POSTER_BOT_TOKENS)
+_channel_poster: dict[int, "BotPoster | MessageLogger"] = {}  # log channel id → resolved poster
 
-_post_queue: asyncio.Queue[tuple[str, list]] = asyncio.Queue()
+# (channel_id, text, files) — target log channel travels with each post
+_post_queue: asyncio.Queue[tuple[int, str, list]] = asyncio.Queue()
 _download_sem = asyncio.Semaphore(5)
 
 _ready_count   = 0
@@ -168,24 +208,46 @@ _profile_fetch_pending: set[int] = set()
 
 
 
+async def _resolve_poster(channel_id: int) -> "BotPoster | MessageLogger | None":
+    """Pick an account that can post to `channel_id`: bot posters first, then
+    poster-only user accounts, then any main client that can see the channel.
+    The winner is cached per channel; the cache entry is dropped on send failure
+    so the next attempt re-resolves."""
+    poster = _channel_poster.get(channel_id)
+    if poster is not None:
+        return poster
+    for bp in _bot_posters:
+        if await bp.can_post(channel_id):
+            _channel_poster[channel_id] = bp
+            return bp
+    for client in (*_user_posters, *_all_clients):
+        if isinstance(client.get_channel(channel_id), discord.TextChannel):
+            _channel_poster[channel_id] = client
+            return client
+    return None
+
+
 async def _post_worker() -> None:
     """Single consumer for log-channel posts; retries with exponential backoff."""
     while True:
-        text, files = await _post_queue.get()
+        channel_id, text, files = await _post_queue.get()
         try:
-            if _log_poster is not None:
-                delay = 1.0
-                for attempt in range(5):
-                    try:
-                        await _log_poster._send_chunked(text, files)
-                        break
-                    except Exception as exc:
-                        console.warning(
-                            "Log channel post failed (attempt %d/5): %s", attempt + 1, exc
-                        )
-                        if attempt < 4:
-                            await asyncio.sleep(delay)
-                            delay = min(delay * 2, 30.0)
+            delay = 1.0
+            for attempt in range(5):
+                try:
+                    poster = await _resolve_poster(channel_id)
+                    if poster is None:
+                        raise RuntimeError(f"no account can post to log channel {channel_id}")
+                    await poster._send_chunked(channel_id, text, files)
+                    break
+                except Exception as exc:
+                    _channel_poster.pop(channel_id, None)
+                    console.warning(
+                        "Log channel post failed (attempt %d/5): %s", attempt + 1, exc
+                    )
+                    if attempt < 4:
+                        await asyncio.sleep(delay)
+                        delay = min(delay * 2, 30.0)
         finally:
             _post_queue.task_done()
 
@@ -869,7 +931,9 @@ async def _setup_server_mirrors(db: aiosqlite.Connection) -> None:
         ])
         console.info("Server mirror: setup complete for %s → %s (%d ch mirrored, %d unreadable, %d forums mirrored, %d unreadable, %d empty cats deleted)",
                      src_guild.name, dst_guild.name, ch_readable, ch_unreadable, fr_readable, fr_unreadable, deleted_cats)
-        await _post_queue.put((summary, []))
+        summary_channel = _log_channel_for(src_guild.id)
+        if summary_channel is not None:
+            await _post_queue.put((summary_channel, summary, []))
 
 
 ARCHIVE_CATEGORY_NAME = "📁 Archived"
@@ -1023,6 +1087,15 @@ async def _save_order_cache(
     await db.commit()
 
 
+def _poster_guild(guild_id: int) -> "discord.Guild | None":
+    """A poster-only user account's view of `guild_id`, if any poster is in it."""
+    for p in _user_posters:
+        g = p.get_guild(guild_id)
+        if g is not None:
+            return g
+    return None
+
+
 async def _refresh_order_cache(db: aiosqlite.Connection) -> None:
     """Rebuild the DB order cache from the current source guild state."""
     for src_guild_id, dst_guild_id in MIRROR_SERVERS:
@@ -1034,10 +1107,9 @@ async def _refresh_order_cache(db: aiosqlite.Connection) -> None:
         dst_guild = dst_client.get_guild(dst_guild_id)
         if src_guild is None or dst_guild is None:
             continue
-        if _log_poster is not None:
-            poster_dst = _log_poster.get_guild(dst_guild_id)
-            if poster_dst is not None:
-                dst_guild = poster_dst
+        poster_dst = _poster_guild(dst_guild_id)
+        if poster_dst is not None:
+            dst_guild = poster_dst
         async with db.execute(
             "SELECT source_channel_id, dest_channel_id FROM server_mirror_channels"
         ) as cur:
@@ -1067,11 +1139,10 @@ async def _sync_channel_ordering(db: aiosqlite.Connection) -> None:
         if src_guild is None or dst_guild is None:
             continue
 
-        # Use log poster for dest edits if she's in the guild — keeps main token's activity cleaner
-        if _log_poster is not None:
-            poster_dst = _log_poster.get_guild(dst_guild_id)
-            if poster_dst is not None:
-                dst_guild = poster_dst
+        # Use a log poster for dest edits if one is in the guild — keeps main token's activity cleaner
+        poster_dst = _poster_guild(dst_guild_id)
+        if poster_dst is not None:
+            dst_guild = poster_dst
 
         cached = await _load_order_cache(db, src_guild_id, dst_guild_id)
         if cached is None:
@@ -1394,20 +1465,36 @@ class BotPoster:
 
     No WebSocket connection — all operations are plain HTTP calls to the
     Discord API with `Authorization: Bot <token>`.  The only guarantee is
-    that it can post text/files to the configured log channel.  Mirror
+    that it can post text/files to channels it has access to.  Mirror
     guild management continues to be handled by the user-token clients.
     """
 
     def __init__(self, db: aiosqlite.Connection) -> None:
         self._db = db
         self._session: aiohttp.ClientSession | None = None
-        self._log_channel_id: int | None = LOG_CHANNEL_ID
-        # Compatibility stub — code that does `_log_poster.get_guild(...)` already
-        # handles None gracefully, so this is safe.
-        self._poster_only = True
+        self._channel_access: dict[int, bool] = {}  # channel id → probe result
 
-    def get_guild(self, guild_id: int) -> None:
-        return None
+    async def can_post(self, channel_id: int) -> bool:
+        """Probe (and cache) whether this bot can see `channel_id`."""
+        if not self._session:
+            return False
+        cached = self._channel_access.get(channel_id)
+        if cached is not None:
+            return cached
+        try:
+            async with self._session.get(
+                f"https://discord.com/api/v10/channels/{channel_id}"
+            ) as resp:
+                if resp.status == 200:
+                    self._channel_access[channel_id] = True
+                    return True
+                if resp.status in (403, 404):
+                    self._channel_access[channel_id] = False
+                    return False
+                console.warning("BotPoster.can_post: HTTP %d for channel %d", resp.status, channel_id)
+        except Exception as exc:
+            console.warning("BotPoster.can_post(%d): %s", channel_id, exc)
+        return False
 
     async def send(self, channel_id: int, content: str) -> bool:
         if not self._session:
@@ -1446,10 +1533,10 @@ class BotPoster:
             content = content[split_at:].lstrip("\n")
         return True
 
-    async def _send_chunked(self, text: str, files: list) -> None:
-        if not self._log_channel_id or not self._session:
+    async def _send_chunked(self, channel_id: int, text: str, files: list) -> None:
+        if not self._session:
             return
-        url = f"https://discord.com/api/v10/channels/{self._log_channel_id}/messages"
+        url = f"https://discord.com/api/v10/channels/{channel_id}/messages"
 
         chunks: list[str] = []
         while text:
@@ -1464,30 +1551,29 @@ class BotPoster:
 
         for i, chunk in enumerate(chunks):
             chunk_files = files if i == len(chunks) - 1 else []
-            try:
-                if chunk_files:
-                    form = aiohttp.FormData()
+            if chunk_files:
+                form = aiohttp.FormData()
+                form.add_field(
+                    "payload_json",
+                    json.dumps({"content": chunk}),
+                    content_type="application/json",
+                )
+                for j, f in enumerate(chunk_files):
+                    f.fp.seek(0)
                     form.add_field(
-                        "payload_json",
-                        json.dumps({"content": chunk}),
-                        content_type="application/json",
+                        f"files[{j}]",
+                        f.fp.read(),
+                        filename=f.filename,
+                        content_type="application/octet-stream",
                     )
-                    for j, f in enumerate(chunk_files):
-                        f.fp.seek(0)
-                        form.add_field(
-                            f"files[{j}]",
-                            f.fp.read(),
-                            filename=f.filename,
-                            content_type="application/octet-stream",
-                        )
-                    await self._session.post(url, data=form)
-                else:
-                    await self._session.post(url, json={"content": chunk})
-            except Exception as exc:
-                console.warning("BotPoster: send failed: %s", exc)
+                resp = await self._session.post(url, data=form)
+            else:
+                resp = await self._session.post(url, json={"content": chunk})
+            if resp.status not in (200, 201):
+                raise RuntimeError(f"BotPoster: HTTP {resp.status} posting to channel {channel_id}")
 
     async def start(self, token: str) -> None:
-        global _log_poster, _ready_count
+        global _ready_count
         self._session = aiohttp.ClientSession(
             headers={"Authorization": f"Bot {token}"}
         )
@@ -1519,7 +1605,7 @@ class BotPoster:
         await self._db.commit()
 
         console.info("BotPoster: logged in as %s (id: %s)", username, user_id)
-        _log_poster = self
+        _bot_posters.append(self)
         _ready_count += 1
         if _server_mirror_ready is not None and _ready_count >= _total_clients:
             _server_mirror_ready.set()
@@ -1537,9 +1623,9 @@ class BotPoster:
 
 
 async def _cmd_reply(message: "discord.Message", text: str) -> None:
-    """Send a command response via the bot token when available, else via the self-bot."""
-    if isinstance(_log_poster, BotPoster):
-        if await _log_poster.send(message.channel.id, text):
+    """Send a command response via a bot token that can reach the channel, else via the self-bot."""
+    for poster in _bot_posters:
+        if await poster.can_post(message.channel.id) and await poster.send(message.channel.id, text):
             return
     await message.channel.send(text)
 
@@ -1606,7 +1692,7 @@ async def _fetch_member_profile(
 
 
 async def _voice_summary_worker(db: aiosqlite.Connection) -> None:
-    """At midnight UTC, post yesterday's VC time per user to the log channel."""
+    """At midnight UTC, post yesterday's VC time per user to each guild's log channel."""
     while True:
         now = datetime.now(timezone.utc)
         next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1614,29 +1700,45 @@ async def _voice_summary_worker(db: aiosqlite.Connection) -> None:
 
         yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
         async with db.execute(
-            """SELECT vs.user_id, vs.author, SUM(vs.duration_seconds),
+            """SELECT vs.guild_id, MAX(vs.guild_name), vs.author, SUM(vs.duration_seconds),
                       mp.display_name, mp.bio
                FROM voice_sessions vs
                LEFT JOIN member_profiles mp ON mp.user_id = vs.user_id
                WHERE DATE(vs.joined_at) = ? AND vs.duration_seconds IS NOT NULL
-               GROUP BY vs.user_id
-               ORDER BY SUM(vs.duration_seconds) DESC""",
+               GROUP BY vs.guild_id, vs.user_id
+               ORDER BY vs.guild_id, SUM(vs.duration_seconds) DESC""",
             (yesterday,),
         ) as cur:
             rows = await cur.fetchall()
         if not rows:
             continue
 
-        lines = [f"🎙️ Voice Activity — {yesterday}"]
-        for _uid, author, total_sec, display_name, bio in rows:
-            name = discord.utils.escape_markdown(display_name or author)
-            line = f"  {name}: {_fmt_duration(total_sec)}"
-            if bio:
-                short_bio = bio[:60] + ("…" if len(bio) > 60 else "")
-                line += f"\n    ↳ {short_bio}"
-            lines.append(line)
-        await _post_queue.put(("\n".join(lines), []))
-        console.info("Voice summary posted for %s (%d users)", yesterday, len(rows))
+        by_guild: dict[int, list] = {}
+        guild_names: dict[int, str | None] = {}
+        for guild_id, guild_name, author, total_sec, display_name, bio in rows:
+            by_guild.setdefault(guild_id, []).append((author, total_sec, display_name, bio))
+            guild_names.setdefault(guild_id, guild_name)
+
+        for guild_id, guild_rows in by_guild.items():
+            channel_id = _log_channel_for(guild_id)
+            if channel_id is None:
+                continue
+            title = f"🎙️ Voice Activity — {yesterday}"
+            if guild_names.get(guild_id):
+                title += f" — {guild_names[guild_id]}"
+            lines = [title]
+            for author, total_sec, display_name, bio in guild_rows:
+                name = discord.utils.escape_markdown(display_name or author)
+                line = f"  {name}: {_fmt_duration(total_sec)}"
+                if bio:
+                    short_bio = bio[:60] + ("…" if len(bio) > 60 else "")
+                    line += f"\n    ↳ {short_bio}"
+                lines.append(line)
+            await _post_queue.put((channel_id, "\n".join(lines), []))
+            console.info(
+                "Voice summary posted for %s in guild %s (%d users)",
+                yesterday, guild_names.get(guild_id) or guild_id, len(guild_rows),
+            )
 
 
 # ── Backfill (historical cache ingestion) ───────────────────────────────────
@@ -1663,16 +1765,15 @@ _active_backfills: set[int] = set()  # source guild ids with a backfill currentl
 _backfill_tasks: set[asyncio.Task] = set()
 
 
-async def _post_backfill_update(text: str, fallback_channel: "discord.abc.Messageable | None") -> None:
-    """Post a backfill status update to the log channel if one is configured,
-    otherwise fall back to the channel the command was run in."""
-    # _log_poster is set as soon as LOG_POSTER_BOT_TOKEN/LOG_POSTER_TOKEN is
-    # configured, regardless of whether LOG_CHANNEL_ID itself is set — so it's
-    # not sufficient on its own to mean "there's a working log channel".
-    # BotPoster._send_chunked silently no-ops without a channel id, which is
-    # why this needs the LOG_CHANNEL_ID check too, not just _log_poster.
-    if LOG_CHANNEL_ID and _log_poster is not None:
-        await _post_queue.put((text, []))
+async def _post_backfill_update(
+    guild_id: int, text: str, fallback_channel: "discord.abc.Messageable | None"
+) -> None:
+    """Post a backfill status update to the source guild's log channel if one is
+    configured and reachable, otherwise fall back to the channel the command was
+    run in."""
+    channel_id = _log_channel_for(guild_id)
+    if channel_id is not None and await _resolve_poster(channel_id) is not None:
+        await _post_queue.put((channel_id, text, []))
         return
     if fallback_channel is not None:
         try:
@@ -1702,6 +1803,7 @@ async def _backfill_progress_ticker(
         verb = "processed" if state.get("download_media") else "cached"
         title = "Backfill (with attachments)" if state.get("download_media") else "Backfill"
         await _post_backfill_update(
+            guild.id,
             f"📼 {title} in progress for **{guild.name}**\n"
             f"Channel {state['channels_done']}/{state['total_channels']} "
             f"(current: #{state['current_channel']}, {state['current_cached']:,} {verb} in it so far)\n"
@@ -1759,13 +1861,14 @@ async def _iter_channel_history_resumable(
 # ── Client ────────────────────────────────────────────────────────────────────
 
 class MessageLogger(discord.Client):
-    def __init__(self, db: aiosqlite.Connection, token_index: int = 0, poster_only: bool = False) -> None:
+    def __init__(self, db: aiosqlite.Connection, token_index: int = 0, poster_only: bool = False,
+                 token: str | None = None) -> None:
         super().__init__()
         self._db = db
         self._token_index = token_index
         self._poster_only = poster_only
+        self._token = token if token is not None else TOKENS[token_index]
         self._session: aiohttp.ClientSession | None = None
-        self._log_channel: discord.TextChannel | None = None
 
     def _is_watched_guild(self, guild_id: int | None) -> bool:
         if self._poster_only:
@@ -1903,7 +2006,7 @@ class MessageLogger(discord.Client):
             f"Sent: <t:{sent_ts}:R>",
             f"Content: {discord.utils.escape_markdown(cached.content) if cached.content else '<no text>'}",
         ]
-        await self._log_to_channel("\n".join(post_lines), files=files)
+        await self._log_to_channel("\n".join(post_lines), files=files, guild_id=guild.id)
         await self._db.execute("DELETE FROM messages WHERE id = ?", (cached.id,))
         await self._db.execute(
             """INSERT INTO message_counts (author_id, author, count, deleted_count, first_seen)
@@ -2118,7 +2221,7 @@ class MessageLogger(discord.Client):
                 f"📼 Backfill started for **{src_guild.name}** — caching full history "
                 f"(no mirroring, no downloads).\n{tail}"
             )
-        await _post_backfill_update(note, message.channel)
+        await _post_backfill_update(src_guild_id, note, message.channel)
 
     async def _run_guild_backfill(
         self, guild: discord.Guild, fallback_channel: "discord.abc.Messageable | None" = None,
@@ -2211,6 +2314,7 @@ class MessageLogger(discord.Client):
             else f"Messages cached this run: {state['total_cached']:,}"
         )
         await _post_backfill_update(
+            guild.id,
             f"✅ {label} complete for **{guild.name}**\n"
             f"Channels backfilled: {channels_done} (already done: {channels_skipped})\n"
             f"{processed_line}\n"
@@ -2221,10 +2325,11 @@ class MessageLogger(discord.Client):
 
     # ── Events ────────────────────────────────────────────────────────────────
 
-    async def _send_chunked(self, text: str, files: list[discord.File]) -> None:
-        """Send text to the log channel, splitting at Discord's 2000-char limit."""
-        if self._log_channel is None:
-            return
+    async def _send_chunked(self, channel_id: int, text: str, files: list[discord.File]) -> None:
+        """Send text to a log channel, splitting at Discord's 2000-char limit."""
+        channel = self.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            raise RuntimeError(f"log channel {channel_id} not visible to this account")
         chunks: list[str] = []
         while text:
             if len(text) <= 2000:
@@ -2236,21 +2341,25 @@ class MessageLogger(discord.Client):
             chunks.append(text[:split_at])
             text = text[split_at:].lstrip("\n")
         for i, chunk in enumerate(chunks):
-            await self._log_channel.send(
+            await channel.send(
                 chunk,
                 files=files if i == len(chunks) - 1 else [],
             )
 
-    async def _log_to_channel(self, text: str, files: list[discord.File] | None = None) -> None:
-        """Enqueue a post; _post_worker sends it sequentially with retry."""
-        await _post_queue.put((text, files or []))
+    async def _log_to_channel(self, text: str, files: list[discord.File] | None = None,
+                              guild_id: int | None = None) -> None:
+        """Enqueue a post to the guild's log channel; _post_worker sends it sequentially with retry."""
+        channel_id = _log_channel_for(guild_id)
+        if channel_id is None:
+            return
+        await _post_queue.put((channel_id, text, files or []))
 
     async def on_ready(self) -> None:
-        global _log_poster, _ready_count
+        global _ready_count
         label = "poster" if self._poster_only else f"token[{self._token_index}]"
         console.info("%s: logged in as %s (id: %s)", label, self.user, self.user.id)
 
-        token = LOG_POSTER_TOKEN if self._poster_only else TOKENS[self._token_index]
+        token = self._token
         await self._db.execute(
             """INSERT OR REPLACE INTO accounts
                (user_id, username, avatar_url, token, poster_only, token_index)
@@ -2265,12 +2374,12 @@ class MessageLogger(discord.Client):
         if self._poster_only:
             for guild in self.guilds:
                 _guild_client.setdefault(guild.id, self)
-            if LOG_CHANNEL_ID and _log_poster is None:
-                ch = self.get_channel(LOG_CHANNEL_ID)
-                if isinstance(ch, discord.TextChannel):
-                    _log_poster = self
-                    self._log_channel = ch
-                    console.info("Log channel: #%s (%s) (dedicated poster: %s)", ch.name, ch.id, self.user)
+            visible = [
+                cid for cid in sorted(_LOG_CHANNEL_IDS)
+                if isinstance(self.get_channel(cid), discord.TextChannel)
+            ]
+            if visible:
+                console.info("Poster %s can post to log channels: %s", self.user, visible)
             _ready_count += 1
             if _server_mirror_ready is not None and _ready_count >= _total_clients:
                 _server_mirror_ready.set()
@@ -2284,12 +2393,6 @@ class MessageLogger(discord.Client):
             _guild_client.setdefault(guild.id, self)
         if claimed:
             console.info("Claimed guilds: %s", claimed)
-        if LOG_CHANNEL_ID and _log_poster is None:
-            ch = self.get_channel(LOG_CHANNEL_ID)
-            if isinstance(ch, discord.TextChannel):
-                _log_poster = self
-                self._log_channel = ch
-                console.info("Log channel: #%s (%s) (poster: %s)", ch.name, ch.id, self.user)
         now = datetime.now(timezone.utc)
         for guild in self.guilds:
             if _guild_owner.get(guild.id) == id(self):
@@ -2309,8 +2412,9 @@ class MessageLogger(discord.Client):
     async def on_message(self, message: discord.Message) -> None:
         if message.content.strip() == "!sync":
             asyncio.create_task(_sync_everything(self._db), name="full-sync-cmd")
-            if self._log_channel is not None:
-                await self._log_to_channel("🔄 Full mirror sync started (archive, names, order)")
+            if message.guild and _guild_client.get(message.guild.id) is self:
+                await self._log_to_channel("🔄 Full mirror sync started (archive, names, order)",
+                                           guild_id=message.guild.id)
             return
 
         if message.content.strip() == "!sync-order":
@@ -2318,8 +2422,9 @@ class MessageLogger(discord.Client):
                 await _refresh_order_cache(db)
                 await _sync_channel_ordering(db)
             asyncio.create_task(_refresh_and_sync(self._db), name="order-sync-cmd")
-            if self._log_channel is not None:
-                await self._log_to_channel("🔄 Channel order sync started")
+            if message.guild and _guild_client.get(message.guild.id) is self:
+                await self._log_to_channel("🔄 Channel order sync started",
+                                           guild_id=message.guild.id)
             return
 
         if message.content.strip() == "!backfill":
@@ -2708,7 +2813,7 @@ class MessageLogger(discord.Client):
 
         if not self._is_watched(message):
             return
-        if self._log_channel and message.channel.id == self._log_channel.id:
+        if message.channel.id in _LOG_CHANNEL_IDS:
             return
 
         if message.guild:
@@ -2790,7 +2895,7 @@ class MessageLogger(discord.Client):
                                after: discord.Message) -> None:
         if not self._is_watched(after):
             return
-        if self._log_channel and after.channel.id == self._log_channel.id:
+        if after.channel.id in _LOG_CHANNEL_IDS:
             return
         if before.content == after.content:
             return
@@ -2835,7 +2940,8 @@ class MessageLogger(discord.Client):
             f"Before: {discord.utils.escape_markdown(before.content)}",
             f"After: {discord.utils.escape_markdown(after.content)}",
         ])
-        await self._log_to_channel(channel_post, files=files)
+        await self._log_to_channel(channel_post, files=files,
+                                   guild_id=after.guild.id if after.guild else None)
 
         mirror_urls = await _mirror_webhooks_for_channel(self._db, after.channel.id)
         for wurl in mirror_urls:
@@ -2856,7 +2962,7 @@ class MessageLogger(discord.Client):
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
         if not self._is_watched_guild(payload.guild_id):
             return
-        if self._log_channel and payload.channel_id == self._log_channel.id:
+        if payload.channel_id in _LOG_CHANNEL_IDS:
             return
 
         cached = await self._pop_cached(payload.message_id)
@@ -2951,7 +3057,7 @@ class MessageLogger(discord.Client):
             post_lines.append("Attachments: " + "  ".join(a['filename'] for a in cached.attachments))
         if cached.stickers:
             post_lines.append("Stickers: " + "  ".join(s['name'] for s in cached.stickers))
-        await self._log_to_channel("\n".join(post_lines), files=files)
+        await self._log_to_channel("\n".join(post_lines), files=files, guild_id=payload.guild_id)
 
         mirror_urls = await _mirror_webhooks_for_channel(self._db, payload.channel_id)
         for wurl in mirror_urls:
@@ -3000,7 +3106,7 @@ class MessageLogger(discord.Client):
     async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
         if not self._is_watched_guild(payload.guild_id):
             return
-        if self._log_channel and payload.channel_id == self._log_channel.id:
+        if payload.channel_id in _LOG_CHANNEL_IDS:
             return
 
         dpy_cached: dict[int, discord.Message] = {m.id: m for m in payload.cached_messages}
@@ -3078,7 +3184,7 @@ class MessageLogger(discord.Client):
             post_lines.append(f"  {author}: {preview}")
         if len(entries) > MAX_PREVIEW:
             post_lines.append(f"  [+ {len(entries) - MAX_PREVIEW} more]")
-        await self._log_to_channel("\n".join(post_lines))
+        await self._log_to_channel("\n".join(post_lines), guild_id=payload.guild_id)
         console.info("Bulk delete: %d messages", len(payload.message_ids))
 
     async def _create_forum_thread_and_send(
@@ -3278,7 +3384,7 @@ class MessageLogger(discord.Client):
                 f"Channel: #{before.channel.name}  ·  {member.guild.name}",
                 f"Duration: {_fmt_duration(duration)}",
             ])
-            await self._log_to_channel(post)
+            await self._log_to_channel(post, guild_id=member.guild.id)
             console.info("Voice leave: %s in #%s (%s)", member, before.channel.name, _fmt_duration(duration))
 
         if after.channel is not None:
@@ -3298,7 +3404,7 @@ class MessageLogger(discord.Client):
             ))
             console.info("Voice join: %s in #%s", member, after.channel.name)
             asyncio.create_task(
-                _fetch_member_profile(self._db, self._session, member, TOKENS[self._token_index]),
+                _fetch_member_profile(self._db, self._session, member, self._token),
                 name=f"profile-fetch-{member.id}",
             )
 
@@ -3636,18 +3742,24 @@ async def main() -> None:
         _mirror_worker(db, mirror_session), name="mirror-worker"
     )
 
-    clients: list[MessageLogger] = [MessageLogger(db, token_index=i) for i in range(len(TOKENS))]
+    main_clients: list[MessageLogger] = [
+        MessageLogger(db, token_index=i, token=TOKENS[i]) for i in range(len(TOKENS))
+    ]
+    _all_clients.extend(main_clients)
+    clients: list[MessageLogger] = list(main_clients)
     tokens: list[str] = list(TOKENS)
     _total_clients = len(clients)
     _server_mirror_ready = asyncio.Event()
 
-    bot_poster: BotPoster | None = None
-    if LOG_POSTER_BOT_TOKEN:
-        bot_poster = BotPoster(db)
-        _total_clients += 1
-    if LOG_POSTER_TOKEN:
-        clients.append(MessageLogger(db, poster_only=True))
-        tokens.append(LOG_POSTER_TOKEN)
+    bot_posters: list[tuple[BotPoster, str]] = [
+        (BotPoster(db), tok) for tok in LOG_POSTER_BOT_TOKENS
+    ]
+    _total_clients += len(bot_posters)
+    for _tok in LOG_POSTER_TOKENS:
+        poster_client = MessageLogger(db, poster_only=True, token=_tok)
+        _user_posters.append(poster_client)
+        clients.append(poster_client)
+        tokens.append(_tok)
         _total_clients += 1
 
     server_mirror_setup = asyncio.create_task(_setup_server_mirrors(db), name="server-mirror-setup")
@@ -3676,12 +3788,10 @@ async def main() -> None:
             if _server_mirror_ready is not None and _ready_count >= _total_clients:
                 _server_mirror_ready.set()
 
-    async def _start_bot_poster() -> None:
+    async def _start_bot_poster(poster: BotPoster, token: str) -> None:
         global _total_clients
-        if bot_poster is None or not LOG_POSTER_BOT_TOKEN:
-            return
         try:
-            await bot_poster.start(LOG_POSTER_BOT_TOKEN)
+            await poster.start(token)
         except (discord.LoginFailure, discord.HTTPException) as exc:
             console.error("BotPoster: login failed, skipping: %s", exc)
             _total_clients -= 1
@@ -3690,13 +3800,12 @@ async def main() -> None:
 
     try:
         coros = [_start_client(c, t) for c, t in zip(clients, tokens)]
-        if bot_poster is not None:
-            coros.append(_start_bot_poster())
+        coros.extend(_start_bot_poster(p, t) for p, t in bot_posters)
         await asyncio.gather(*coros)
     finally:
         await asyncio.gather(*[client.close() for client in clients])
-        if bot_poster is not None:
-            await bot_poster.close()
+        for poster, _ in bot_posters:
+            await poster.close()
         await db.close()
         for task in (worker, mirror_worker, server_mirror_setup, archive_sync, daily_order_sync, voice_summary):
             task.cancel()

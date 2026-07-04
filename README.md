@@ -10,7 +10,7 @@ Logging is always active for watched guilds. No extra configuration beyond a tok
 - **Message logging** — every new message, edit, and delete is written to dated flat files under `logs/<guild>/<channel>_YYYY-MM-DD.log`
 - **SQLite cache** — message content and metadata stored in `data/cache.db` so deleted messages can be logged with their original content
 - **Media saving** — attachments and stickers downloaded locally to `media/`
-- **Log channel** — optionally post edit/delete summaries to a Discord channel in real time with attachment previews (`LOG_CHANNEL_ID`)
+- **Log channel** — optionally post edit/delete summaries to a Discord channel in real time with attachment previews (`LOG_CHANNEL_ID`); per-guild overrides route individual servers to their own channels (`LOG_CHANNELS`)
 - **Missed delete detection** — on reconnect, recent history is fetched per channel and any messages deleted while offline are logged retroactively
 
 ### Mirroring
@@ -47,9 +47,10 @@ Mirroring is opt-in and configured separately from logging. Set `MIRROR_CHANNELS
 
 ### General
 - **Multi-account** — multiple user tokens can be provided; each claims guilds and shares one DB
-- **Log poster token** — offloads log channel posts and all command replies to a dedicated account, keeping the main token's activity pattern cleaner. Two options (can be set together):
-  - `LOG_POSTER_BOT_TOKEN` — a legitimate Discord bot token (recommended); connects via REST only, no WebSocket. Used for all command replies and log channel posts when set.
-  - `LOG_POSTER_TOKEN` — a secondary user account token. When set alongside `LOG_POSTER_BOT_TOKEN`, stays connected for guild presence and command handling in guilds the bot token can't see. When set alone, also handles posting.
+- **Log poster tokens** — offload log channel posts and all command replies to dedicated accounts, keeping the main token's activity pattern cleaner. Two kinds, each accepting a comma-separated list (can be set together):
+  - `LOG_POSTER_BOT_TOKENS` — one or more legitimate Discord bot tokens (recommended); connect via REST only, no WebSocket. For a given log channel, the first bot that can see it posts there.
+  - `LOG_POSTER_TOKENS` — one or more secondary user account tokens. These stay connected for guild presence and command handling in guilds the bot tokens can't see.
+  - Posting is resolved **per log channel**: bot posters are tried first, then user posters, then any main account that can see the channel — so you can log servers that no single account is a member of by spreading membership across several poster tokens. The singular `LOG_POSTER_BOT_TOKEN` / `LOG_POSTER_TOKEN` names still work and are merged into the lists.
 
 ## Setup
 
@@ -68,15 +69,19 @@ DISCORD_TOKENS=token1,token2
 # Optional: restrict logging to specific guild IDs (comma-separated)
 WATCHED_GUILDS=
 
-# Optional: post edit/delete summaries to this channel
+# Optional: default channel to post edit/delete summaries to
 LOG_CHANNEL_ID=
-# Optional: legitimate Discord bot token for posting to LOG_CHANNEL_ID (recommended)
-# The bot only needs Send Messages + Attach Files in the log channel.
-# Takes priority over LOG_POSTER_TOKEN if both are set.
-LOG_POSTER_BOT_TOKEN=
-# Optional: secondary user account token for posting to LOG_CHANNEL_ID
-# Used only when LOG_POSTER_BOT_TOKEN is not set.
-LOG_POSTER_TOKEN=
+# Optional: per-guild log channel overrides (guild_id:channel_id, comma-separated)
+# Listed guilds post to their own channel; everything else uses LOG_CHANNEL_ID.
+LOG_CHANNELS=
+# Optional: legitimate Discord bot token(s) for posting to the log channels
+# (recommended, comma-separated). Each needs Send Messages + Attach Files.
+# The singular LOG_POSTER_BOT_TOKEN is still accepted and merged in.
+LOG_POSTER_BOT_TOKENS=
+# Optional: secondary user account token(s) for posting (comma-separated).
+# Posting is resolved per channel: bot posters, then user posters, then any
+# main account that can see it. The singular LOG_POSTER_TOKEN still works.
+LOG_POSTER_TOKENS=
 
 # Optional: mirror individual channels to webhook URLs
 # Format: channel_id:webhook_url,channel_id:webhook_url
