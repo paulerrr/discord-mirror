@@ -2092,24 +2092,33 @@ class MessageLogger(discord.Client):
         )
         _backfill_tasks.add(task)
         task.add_done_callback(_backfill_tasks.discard)
+        mins = int(BACKFILL_PROGRESS_INTERVAL // 60)
+        tail = f"Progress posts every {mins} min, with a summary when it's done."
         if download_media:
+            # Tell the user whether history is already cached, so they know if this
+            # run backfills everything or effectively just fetches attachments.
+            async with self._db.execute(
+                "SELECT COUNT(*) FROM backfill_progress WHERE guild_id = ? AND done = 1",
+                (src_guild_id,),
+            ) as cur:
+                content_done = (await cur.fetchone())[0]
+            if content_done == 0:
+                scope = "No prior backfill found — caching the full history *and* downloading attachments."
+            else:
+                scope = (
+                    f"History is already cached ({content_done} channels) — this run mainly downloads "
+                    f"attachments (and caches any channels not done yet)."
+                )
             note = (
-                f"📼 Backfill (with attachments) started for source guild **{src_guild.name}** — "
-                f"caching full history into the delete-recovery cache and downloading attachments "
-                f"and stickers to media/ (no mirroring). Runs independently of a plain `!backfill`, "
-                f"so it also serves to fetch attachments for an already-cached guild. "
+                f"📼 Backfill with attachments started for **{src_guild.name}**.\n"
+                f"{scope}\n{tail}"
             )
         else:
             note = (
-                f"📼 Backfill started for source guild **{src_guild.name}** — caching full history "
-                f"into the delete-recovery cache (no mirroring, no downloads). "
+                f"📼 Backfill started for **{src_guild.name}** — caching full history "
+                f"(no mirroring, no downloads).\n{tail}"
             )
-        await _post_backfill_update(
-            note
-            + f"Progress updates will post every {int(BACKFILL_PROGRESS_INTERVAL // 60)} min, "
-            f"with a summary when it's done.",
-            message.channel,
-        )
+        await _post_backfill_update(note, message.channel)
 
     async def _run_guild_backfill(
         self, guild: discord.Guild, fallback_channel: "discord.abc.Messageable | None" = None,
