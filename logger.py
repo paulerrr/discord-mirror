@@ -208,15 +208,20 @@ _profile_fetch_pending: set[int] = set()
 
 
 
-async def _resolve_poster(channel_id: int) -> "BotPoster | MessageLogger | None":
+async def _resolve_poster(
+    channel_id: int, failed_bot_posters: set["BotPoster"] | None = None
+) -> "BotPoster | MessageLogger | None":
     """Pick an account that can post to `channel_id`: bot posters first, then
     poster-only user accounts, then any main client that can see the channel.
     The winner is cached per channel; the cache entry is dropped on send failure
     so the next attempt re-resolves."""
+    failed_bot_posters = failed_bot_posters or set()
     poster = _channel_poster.get(channel_id)
-    if poster is not None:
+    if poster is not None and poster not in failed_bot_posters:
         return poster
     for bp in _bot_posters:
+        if bp in failed_bot_posters:
+            continue
         if await bp.can_post(channel_id):
             _channel_poster[channel_id] = bp
             return bp
@@ -234,9 +239,10 @@ async def _post_worker() -> None:
         try:
             delay = 1.0
             poster: "BotPoster | MessageLogger | None" = None
+            failed_bot_posters: set["BotPoster"] = set()
             for attempt in range(5):
                 try:
-                    poster = await _resolve_poster(channel_id)
+                    poster = await _resolve_poster(channel_id, failed_bot_posters)
                     if poster is None:
                         raise RuntimeError(f"no account can post to log channel {channel_id}")
                     # A send on a wedged connection can hang forever (no timeout
@@ -251,13 +257,12 @@ async def _post_worker() -> None:
                     break
                 except Exception as exc:
                     _channel_poster.pop(channel_id, None)
-                    # A stale can_post() probe would otherwise re-select the same
-                    # broken bot poster forever, since resolving only drops the
-                    # per-channel winner cache above, not the bot's own reachability
-                    # cache — so the "re-resolve on failure" retry would never
-                    # actually try a different account.
+                    # GET /channels/{id} only establishes that a bot can view the
+                    # channel; it may still lack Send Messages. Keep a failed bot
+                    # out of this item's remaining retries so resolution reaches
+                    # another bot or a user poster instead of re-selecting it.
                     if isinstance(poster, BotPoster):
-                        poster.invalidate(channel_id)
+                        failed_bot_posters.add(poster)
                     console.warning(
                         "Log channel post failed (attempt %d/5): %s", attempt + 1, exc
                     )
@@ -1510,10 +1515,6 @@ class BotPoster:
         self._db = db
         self._session: aiohttp.ClientSession | None = None
         self._channel_access: dict[int, bool] = {}  # channel id → probe result
-
-    def invalidate(self, channel_id: int) -> None:
-        """Drop the cached reachability probe so the next can_post() re-checks."""
-        self._channel_access.pop(channel_id, None)
 
     async def can_post(self, channel_id: int) -> bool:
         """Probe (and cache) whether this bot can see `channel_id`."""
