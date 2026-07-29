@@ -233,6 +233,7 @@ async def _post_worker() -> None:
         channel_id, text, files = await _post_queue.get()
         try:
             delay = 1.0
+            poster: "BotPoster | MessageLogger | None" = None
             for attempt in range(5):
                 try:
                     poster = await _resolve_poster(channel_id)
@@ -250,6 +251,13 @@ async def _post_worker() -> None:
                     break
                 except Exception as exc:
                     _channel_poster.pop(channel_id, None)
+                    # A stale can_post() probe would otherwise re-select the same
+                    # broken bot poster forever, since resolving only drops the
+                    # per-channel winner cache above, not the bot's own reachability
+                    # cache — so the "re-resolve on failure" retry would never
+                    # actually try a different account.
+                    if isinstance(poster, BotPoster):
+                        poster.invalidate(channel_id)
                     console.warning(
                         "Log channel post failed (attempt %d/5): %s", attempt + 1, exc
                     )
@@ -1502,6 +1510,10 @@ class BotPoster:
         self._db = db
         self._session: aiohttp.ClientSession | None = None
         self._channel_access: dict[int, bool] = {}  # channel id → probe result
+
+    def invalidate(self, channel_id: int) -> None:
+        """Drop the cached reachability probe so the next can_post() re-checks."""
+        self._channel_access.pop(channel_id, None)
 
     async def can_post(self, channel_id: int) -> bool:
         """Probe (and cache) whether this bot can see `channel_id`."""
