@@ -93,6 +93,13 @@ for _pair in os.environ.get("MIRROR_SERVERS", "").split(","):
     if _src and _dst:
         MIRROR_SERVERS.append((int(_src), int(_dst)))
 
+# Source text channels whose name starts with one of these prefixes are never
+# mirrored by MIRROR_SERVERS (e.g. private mod-ticket channels), and existing
+# mirrors of them are deleted on startup. Set to empty to mirror everything.
+MIRROR_SKIP_PREFIXES: tuple[str, ...] = tuple(
+    p.strip().lower() for p in os.environ.get("MIRROR_SKIP_PREFIXES", "ticket-").split(",") if p.strip()
+)
+
 _server_mirror_src: set[int] = {s for s, _d in MIRROR_SERVERS}
 _server_mirror_dst_to_src: dict[int, int] = {d: s for s, d in MIRROR_SERVERS}
 
@@ -380,12 +387,18 @@ async def _get_or_create_category(
         return None
 
 
+def _is_skipped_mirror_name(name: str) -> bool:
+    return name.lower().startswith(MIRROR_SKIP_PREFIXES) if MIRROR_SKIP_PREFIXES else False
+
+
 async def _ensure_server_mirror_channel(
     db: aiosqlite.Connection,
     dst_guild: discord.Guild,
     src_channel: discord.TextChannel,
     category_cache: dict[str, discord.CategoryChannel],
 ) -> None:
+    if _is_skipped_mirror_name(src_channel.name):
+        return
     async with db.execute(
         "SELECT webhook_url FROM server_mirror_channels WHERE source_channel_id = ?",
         (src_channel.id,),
@@ -653,6 +666,59 @@ async def _clear_dest_guild(db: aiosqlite.Connection, dst_guild: discord.Guild) 
     console.info("Server mirror: cleared dest guild '%s'", dst_guild.name)
 
 
+async def _prune_skipped_mirror_channels(
+    db: aiosqlite.Connection,
+    src_guild: discord.Guild,
+    dst_guild: discord.Guild,
+) -> None:
+    """Delete dest mirrors of channels matching MIRROR_SKIP_PREFIXES, then any
+    🔒 Unreadable / 📁 Archived categories that pruning left empty."""
+    if not MIRROR_SKIP_PREFIXES:
+        return
+    async with db.execute(
+        "SELECT source_channel_id, dest_channel_id FROM server_mirror_channels"
+    ) as cur:
+        rows = await cur.fetchall()
+
+    pruned = 0
+    deleted_ids: set[int] = set()
+    for src_id, dst_id in rows:
+        src_ch = src_guild.get_channel(src_id)
+        dst_ch = dst_guild.get_channel(dst_id)
+        name = dst_ch.name if dst_ch else (src_ch.name if src_ch else None)
+        if name is None or not _is_skipped_mirror_name(name):
+            continue
+        if dst_ch is not None:
+            try:
+                await dst_ch.delete()
+            except discord.NotFound:
+                pass
+            except Exception as exc:
+                console.warning("Server mirror: could not prune #%s: %s", name, exc)
+                continue
+            deleted_ids.add(dst_ch.id)
+        await db.execute("DELETE FROM server_mirror_channels WHERE source_channel_id = ?", (src_id,))
+        await db.commit()
+        pruned += 1
+
+    if not pruned:
+        return
+
+    # The guild cache may still list just-deleted channels, so discount them.
+    for cat in list(dst_guild.categories):
+        if not _is_special_category_name(cat.name):
+            continue
+        if any(ch.id not in deleted_ids for ch in cat.channels):
+            continue
+        try:
+            await cat.delete()
+            console.info("Server mirror: deleted empty category '%s' in %s", cat.name, dst_guild.name)
+        except Exception as exc:
+            console.warning("Server mirror: could not delete empty category '%s': %s", cat.name, exc)
+
+    console.info("Server mirror: pruned %d skipped channel(s) from %s", pruned, dst_guild.name)
+
+
 async def _probe_readable(channel: discord.TextChannel | discord.VoiceChannel) -> bool:
     try:
         async for _ in channel.history(limit=1):
@@ -760,6 +826,7 @@ async def _setup_server_mirrors(db: aiosqlite.Connection) -> None:
                     "Server mirror: %s → %s already set up (%d channels mapped), checking for new/unreadable channels",
                     src_guild.name, dst_guild.name, already_mapped,
                 )
+                await _prune_skipped_mirror_channels(db, src_guild, dst_guild)
                 category_cache: dict[str, discord.CategoryChannel] = {}
 
                 # Which text/voice channels are already mapped and their readable state

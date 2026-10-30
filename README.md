@@ -90,6 +90,10 @@ MIRROR_CHANNELS=
 # Optional: mirror entire guilds
 # Format: src_guild_id:dst_guild_id,src_guild_id:dst_guild_id
 MIRROR_SERVERS=
+
+# Optional: source channel name prefixes MIRROR_SERVERS never mirrors (default: ticket-)
+# Format: prefix,prefix — set empty to mirror every channel
+MIRROR_SKIP_PREFIXES=ticket-
 ```
 
 ### Run
@@ -116,6 +120,8 @@ On first run, the bot:
 5. Syncs channel and category order to match the source
 
 On subsequent restarts, if channels are already mapped in the DB the rebuild is skipped entirely.
+
+Text channels whose name starts with a `MIRROR_SKIP_PREFIXES` prefix (default `ticket-`) are never mirrored. They are typically private mod-ticket channels that are unreadable and get deleted from the source, so mirroring them only fills the destination toward Discord's 500-channel limit. On each restart, existing mirrors of them are deleted along with any `🔒 Unreadable` / `📁 Archived` categories left empty.
 
 Every 30 minutes an archive sync worker re-checks for channels that have disappeared (moved to `📁 Archived`) or become newly readable (webhook provisioned, moved to proper category), and reconciles any channel names that drifted while the bot was disconnected.
 
